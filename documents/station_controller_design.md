@@ -1,0 +1,530 @@
+# StationController フレームワーク 設計書
+
+## 1. 概要
+
+複数の対象（ステーション）を切り替えながら、各対象に対して操作を実行する装置・プロセスを、Pythonから統一的に制御するためのフレームワーク。
+
+オートサンプラー、マルチポート弁、テストチャンネル切替器など、「接続 → 対象選択 → 実行」のパターンを持つあらゆる装置に適用可能。
+
+### 設計方針
+
+- 具体クラスの実装者は **async メソッド (`_do_xxx`) を1箇所書くだけ** で、sync/async 両方の公開APIが得られる
+- 固有機能は **メタデータ駆動** で宣言し、具体クラスがフレームワーク（FastAPI/Typer等）に依存しない状態を保つ
+- ファクトリ関数に具体クラスのインスタンスを渡すだけで、HTTP API・CLI・GUI が自動的に立ち上がる
+
+---
+
+## 2. パッケージ構成
+
+```
+stationkit/
+├── core/
+│   ├── __init__.py
+│   ├── base.py            # StationControllerBase
+│   ├── action.py           # CustomAction 定義
+│   ├── state.py            # ControllerState (状態 enum)
+│   └── exceptions.py       # 例外階層
+├── adapters/
+│   ├── __init__.py
+│   ├── http.py             # create_http_app() - FastAPI ファクトリ
+│   ├── cli.py              # create_cli_app() - Typer ファクトリ
+│   └── gui.py              # create_gui_app() - GUI ファクトリ (将来)
+├── testing/
+│   ├── __init__.py
+│   └── mock.py             # MockStationController
+└── __init__.py
+```
+
+---
+
+## 3. コアクラス設計
+
+### 3.1 状態管理: `ControllerState`
+
+```python
+# stationkit/core/state.py
+from enum import Enum, auto
+
+class ControllerState(Enum):
+    DISCONNECTED = auto()
+    CONNECTED = auto()
+    BUSY = auto()
+    ERROR = auto()
+```
+
+### 3.2 例外階層
+
+```python
+# stationkit/core/exceptions.py
+
+class StationError(Exception):
+    """フレームワーク共通の基底例外"""
+
+class ConnectionError(StationError):
+    """接続・切断に関するエラー"""
+
+class CommandError(StationError):
+    """コマンド送信・応答に関するエラー"""
+
+class TimeoutError(StationError):
+    """操作のタイムアウト"""
+
+class StateError(StationError):
+    """不正な状態遷移（未接続で execute を呼んだ等）"""
+```
+
+### 3.3 基底クラス: `StationControllerBase`
+
+実装者は `_do_xxx` メソッド群（async）をオーバーライドする。
+公開APIは sync 版 (`connect`, `execute`, ...) と async 版 (`connect_async`, `execute_async`, ...) の二重インターフェースで提供される。
+状態ガード等の共通処理は公開API側に集約し、具体クラスに漏れない設計とする。
+
+```python
+# stationkit/core/base.py
+from abc import ABC, abstractmethod
+from typing import Any, List
+import asyncio
+
+from stationkit.core.state import ControllerState
+from stationkit.core.action import CustomAction
+from stationkit.core.exceptions import StateError
+
+
+class StationControllerBase(ABC):
+
+    def __init__(self):
+        self._state: ControllerState = ControllerState.DISCONNECTED
+
+    @property
+    def state(self) -> ControllerState:
+        return self._state
+
+    # =========================================================
+    # 実装者がオーバーライドする内部メソッド (async)
+    # =========================================================
+
+    @abstractmethod
+    async def _do_connect(self, address: str) -> None: ...
+
+    @abstractmethod
+    async def _do_disconnect(self) -> None: ...
+
+    @abstractmethod
+    async def _do_change(self, target: Any) -> None: ...
+
+    @abstractmethod
+    async def _do_execute(self) -> Any: ...
+
+    @abstractmethod
+    async def _do_status(self) -> dict: ...
+
+    # =========================================================
+    # async 公開API (共通処理を含む)
+    # =========================================================
+
+    async def connect_async(self, address: str) -> None:
+        if self._state != ControllerState.DISCONNECTED:
+            raise StateError(
+                f"connect requires DISCONNECTED state, "
+                f"current: {self._state.name}"
+            )
+        await self._do_connect(address)
+        self._state = ControllerState.CONNECTED
+
+    async def disconnect_async(self) -> None:
+        if self._state == ControllerState.DISCONNECTED:
+            raise StateError("Already disconnected")
+        await self._do_disconnect()
+        self._state = ControllerState.DISCONNECTED
+
+    async def change_async(self, target: Any) -> None:
+        self._require_connected()
+        await self._do_change(target)
+
+    async def execute_async(self) -> Any:
+        self._require_connected()
+        self._state = ControllerState.BUSY
+        try:
+            result = await self._do_execute()
+            self._state = ControllerState.CONNECTED
+            return result
+        except Exception:
+            self._state = ControllerState.ERROR
+            raise
+
+    async def status_async(self) -> dict:
+        return {
+            "controller_state": self._state.name,
+            **(await self._do_status()),
+        }
+
+    # =========================================================
+    # sync 公開API (async 版のラッパー)
+    # =========================================================
+
+    def connect(self, address: str) -> None:
+        self._run_sync(self.connect_async(address))
+
+    def disconnect(self) -> None:
+        self._run_sync(self.disconnect_async())
+
+    def change(self, target: Any) -> None:
+        self._run_sync(self.change_async(target))
+
+    def execute(self) -> Any:
+        return self._run_sync(self.execute_async())
+
+    def status(self) -> dict:
+        return self._run_sync(self.status_async())
+
+    # =========================================================
+    # 固有機能 (メタデータ駆動)
+    # =========================================================
+
+    def get_custom_actions(self) -> List[CustomAction]:
+        """固有機能のリストを返す。デフォルトは空。"""
+        return []
+
+    # =========================================================
+    # 内部ユーティリティ
+    # =========================================================
+
+    def _require_connected(self) -> None:
+        if self._state not in (
+            ControllerState.CONNECTED,
+            ControllerState.BUSY,
+        ):
+            raise StateError(
+                f"Operation requires CONNECTED state, "
+                f"current: {self._state.name}"
+            )
+
+    @staticmethod
+    def _run_sync(coro):
+        try:
+            asyncio.get_running_loop()
+            raise RuntimeError(
+                "sync API をイベントループ内から呼ばないでください。"
+                "xxx_async() を使用してください。"
+            )
+        except RuntimeError as e:
+            msg = str(e)
+            if "no current event loop" in msg or "no running event loop" in msg:
+                return asyncio.run(coro)
+            raise
+```
+
+### 3.4 固有機能定義: `CustomAction`
+
+フレームワーク非依存の純粋なデータクラス。
+ファクトリがこの情報を読み取り、エンドポイントやコマンドを自動生成する。
+
+```python
+# stationkit/core/action.py
+from dataclasses import dataclass, field
+from typing import Callable, Type, Optional
+from pydantic import BaseModel
+
+
+@dataclass
+class CustomAction:
+    name: str                                  # 機能名 (例: "calibrate")
+    description: str                           # 説明
+    func: Callable                             # 実行されるメソッド
+    input_schema: Type[BaseModel]              # 引数の型 (Pydantic モデル)
+    output_schema: Optional[Type[BaseModel]] = None  # 戻り値の型 (任意)
+```
+
+---
+
+## 4. 具体クラスの実装例
+
+### 4.1 基本的な装置
+
+```python
+class AutoSamplerDriver(StationControllerBase):
+    """整数ポジションで対象を切り替えるオートサンプラー"""
+
+    def __init__(self):
+        super().__init__()
+        self._connection = None
+        self._current_position: int | None = None
+
+    async def _do_connect(self, address: str) -> None:
+        self._connection = await open_serial(address)
+
+    async def _do_disconnect(self) -> None:
+        await self._connection.close()
+        self._connection = None
+
+    async def _do_change(self, target: int) -> None:
+        await self._connection.send(f"POS {target}")
+        self._current_position = target
+
+    async def _do_execute(self) -> dict:
+        response = await self._connection.send("SAMPLE")
+        return {"position": self._current_position, "result": response}
+
+    async def _do_status(self) -> dict:
+        return {"current_position": self._current_position}
+```
+
+### 4.2 固有機能を持つ装置
+
+```python
+class CalibrateInput(BaseModel):
+    level: int
+    force: bool = False
+
+class CalibrateOutput(BaseModel):
+    status: str
+    level: int
+
+class AdvancedSamplerDriver(StationControllerBase):
+
+    async def _do_connect(self, address: str) -> None: ...
+    async def _do_disconnect(self) -> None: ...
+    async def _do_change(self, target: int) -> None: ...
+    async def _do_execute(self) -> dict: ...
+    async def _do_status(self) -> dict: ...
+
+    # --- 固有機能 ---
+
+    async def _do_calibrate(self, params: CalibrateInput) -> dict:
+        # キャリブレーション処理
+        return {"status": "success", "level": params.level}
+
+    def get_custom_actions(self) -> list[CustomAction]:
+        return [
+            CustomAction(
+                name="calibrate",
+                description="機器のキャリブレーションを実行します",
+                func=self._do_calibrate,
+                input_schema=CalibrateInput,
+                output_schema=CalibrateOutput,
+            ),
+        ]
+```
+
+---
+
+## 5. ファクトリ（アダプタ）
+
+### 5.1 `change` の型解決
+
+ファクトリは具体クラスの `_do_change` の型ヒントを実行時に取得し、エンドポイント/コマンドの引数型を決定する。
+
+```python
+from typing import get_type_hints, Any
+
+def _resolve_target_type(controller: StationControllerBase) -> type:
+    hints = get_type_hints(controller._do_change)
+    target_type = hints.get("target", Any)
+    if target_type is Any:
+        import warnings
+        warnings.warn(
+            f"{type(controller).__name__}._do_change の target に"
+            f"型ヒントがありません。str として扱います。",
+            stacklevel=2,
+        )
+        return str
+    return target_type
+```
+
+### 5.2 FastAPI ファクトリ: `create_http_app()`
+
+```python
+# stationkit/adapters/http.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import get_type_hints
+
+def create_http_app(controller: StationControllerBase) -> FastAPI:
+    app = FastAPI(title=type(controller).__name__)
+    target_type = _resolve_target_type(controller)
+
+    class ConnectRequest(BaseModel):
+        address: str
+
+    class ChangeRequest(BaseModel):
+        target: target_type  # 動的に型が決まる
+
+    @app.post("/connect")
+    async def connect(req: ConnectRequest):
+        await controller.connect_async(req.address)
+        return {"ok": True}
+
+    @app.post("/disconnect")
+    async def disconnect():
+        await controller.disconnect_async()
+        return {"ok": True}
+
+    @app.get("/status")
+    async def status():
+        return await controller.status_async()
+
+    @app.post("/change")
+    async def change(req: ChangeRequest):
+        await controller.change_async(req.target)
+        return {"ok": True}
+
+    @app.post("/execute")
+    async def execute():
+        return await controller.execute_async()
+
+    # --- CustomAction の自動登録 ---
+    for action in controller.get_custom_actions():
+        def _make_endpoint(act):
+            async def endpoint(params: act.input_schema):
+                return await act.func(params)
+            endpoint.__name__ = act.name
+            return endpoint
+
+        app.post(
+            f"/actions/{action.name}",
+            description=action.description,
+            response_model=action.output_schema,
+        )(_make_endpoint(action))
+
+    return app
+```
+
+### 5.3 Typer ファクトリ: `create_cli_app()`
+
+```python
+# stationkit/adapters/cli.py
+import typer
+from typing import get_type_hints
+
+def create_cli_app(controller: StationControllerBase) -> typer.Typer:
+    app = typer.Typer(name=type(controller).__name__)
+    target_type = _resolve_target_type(controller)
+
+    @app.command()
+    def connect(address: str):
+        controller.connect(address)
+        typer.echo("Connected.")
+
+    @app.command()
+    def disconnect():
+        controller.disconnect()
+        typer.echo("Disconnected.")
+
+    @app.command()
+    def status():
+        typer.echo(controller.status())
+
+    @app.command()
+    def change(target: target_type):
+        controller.change(target)
+        typer.echo(f"Changed to {target}.")
+
+    @app.command()
+    def execute():
+        result = controller.execute()
+        typer.echo(result)
+
+    # --- CustomAction の自動登録 ---
+    for action in controller.get_custom_actions():
+        def _make_command(act):
+            def command(params_json: str):
+                """JSON 文字列で引数を渡す"""
+                parsed = act.input_schema.model_validate_json(params_json)
+                result = asyncio.run(act.func(parsed))
+                typer.echo(result)
+            command.__name__ = act.name
+            command.__doc__ = act.description
+            return command
+
+        app.command(name=action.name)(_make_command(action))
+
+    return app
+```
+
+---
+
+## 6. テスト支援: `MockStationController`
+
+実機器なしでファクトリやアプリケーションの動作を検証するためのモック。
+
+```python
+# stationkit/testing/mock.py
+
+class MockStationController(StationControllerBase):
+    """テスト・デモ用のモックコントローラ"""
+
+    def __init__(self):
+        super().__init__()
+        self._current_target = None
+        self._call_log: list[str] = []
+
+    async def _do_connect(self, address: str) -> None:
+        self._call_log.append(f"connect({address})")
+
+    async def _do_disconnect(self) -> None:
+        self._call_log.append("disconnect()")
+
+    async def _do_change(self, target: int) -> None:
+        self._call_log.append(f"change({target})")
+        self._current_target = target
+
+    async def _do_execute(self) -> dict:
+        self._call_log.append("execute()")
+        return {"mock": True, "target": self._current_target}
+
+    async def _do_status(self) -> dict:
+        return {"current_target": self._current_target}
+```
+
+---
+
+## 7. 利用フロー
+
+```python
+# --- 具体クラスのインスタンスを作る ---
+sampler = AutoSamplerDriver()
+
+# --- HTTP サーバーとして起動 ---
+app = create_http_app(sampler)
+# uvicorn で起動: uvicorn main:app
+
+# --- CLI として起動 ---
+cli = create_cli_app(sampler)
+# python main.py connect COM3
+
+# --- スクリプトから直接使用 (sync) ---
+sampler.connect("COM3")
+sampler.change(1)
+result = sampler.execute()
+sampler.disconnect()
+
+# --- async コードから使用 ---
+async def main():
+    await sampler.connect_async("COM3")
+    await sampler.change_async(1)
+    result = await sampler.execute_async()
+    await sampler.disconnect_async()
+```
+
+---
+
+## 8. 設計上の補足
+
+### エラーハンドリング方針
+
+- 具体クラスの `_do_xxx` 内で発生した例外は `stationkit.core.exceptions` の型に変換して送出することを推奨する
+- ファクトリ（HTTP/CLI）側で `StationError` 系を一括キャッチし、適切なレスポンス（HTTP 4xx/5xx、CLI エラー表示）に変換する
+- `StateError` は基底クラスが自動送出するため、具体クラスでのガード実装は不要
+
+### `target: Any` の型ヒント運用ルール
+
+- 基底クラスでは `target: Any` として柔軟性を確保する
+- 具体クラスは **必ず** `_do_change(self, target: int)` のように具体型を付与する
+- ファクトリは `get_type_hints()` で具体型を取得する。`Any` のまま残っている場合は警告を出し `str` にフォールバックする
+
+### 今後の拡張候補
+
+- **イベント / フック機構**: `on_connect`, `on_execute_complete` 等のコールバック
+- **バッチ実行**: 複数ステーションへの連続操作を宣言的に記述する機能
+- **GUI アダプタ**: `create_gui_app()` の実装（Tkinter / web UI 等）
+- **ロギング**: 基底クラスの公開APIに統一的なログ出力を組み込む
