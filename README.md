@@ -1,4 +1,4 @@
-# cesoji / stationkit
+# stationkit
 
 複数の対象（ステーション）を切り替えながら操作する装置を、**同じパターン**で扱うための Python フレームワークです。オートサンプラー、マルチポート弁、テスト用チャネル切替器など、「接続 → 対象選択 → 実行」という流れが共通する機器を想定しています。
 
@@ -237,7 +237,7 @@ uv run python mycli.py disconnect
 uv run python main.py --help
 ```
 
-`pyproject.toml` の `[project.scripts]` で `cesoji` コマンドも定義しているため、パッケージをインストールした環境では `cesoji` で同様に起動できます。
+`pyproject.toml` の `[project.scripts]` で `stationkit` コマンドも定義しているため、パッケージをインストールした環境では `stationkit` で同様に起動できます。
 
 ## テスト
 

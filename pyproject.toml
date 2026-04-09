@@ -1,5 +1,5 @@
 [project]
-name = "cesoji"
+name = "stationkit"
 version = "0.1.0"
 description = "Station controller framework prototype"
 readme = "README.md"
@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-cesoji = "main:main"
+stationkit = "main:main"
 
 [dependency-groups]
 dev = [
