@@ -4,7 +4,12 @@
 ``create_http_app``, ``create_cli_app``）。
 """
 
-from stationkit.adapters import create_cli_app, create_gui_app, create_http_app
+from stationkit.adapters import (
+    create_cli_app,
+    create_gui_app,
+    create_http_app,
+    create_local_cli_app,
+)
 from stationkit.core import (
     CommandError,
     ConnectionError,
@@ -24,6 +29,7 @@ __all__ = [
     "create_cli_app",
     "create_gui_app",
     "create_http_app",
+    "create_local_cli_app",
     "CustomAction",
     "MockStationController",
     "StateError",

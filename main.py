@@ -1,7 +1,7 @@
 """デモ用エントリポイント: モックコントローラにバインドした CLI。
 
-本番では自前の ``StationControllerBase`` サブクラスを用意し、
-同様に ``create_cli_app`` または ``create_http_app`` に渡す。
+この CLI は ``serve`` で常駐 service を起動し、他のサブコマンドは
+その service に HTTP 経由でアクセスする。
 """
 
 from stationkit import MockStationController, create_cli_app

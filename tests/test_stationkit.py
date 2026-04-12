@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
+import stationkit.adapters.cli as cli_adapter
 from stationkit import (
     ControllerState,
     CustomAction,
     create_cli_app,
     create_http_app,
+    create_local_cli_app,
 )
 from stationkit.testing import MockStationController
 
@@ -147,10 +150,10 @@ def test_http_adapter_exposes_core_and_custom_actions() -> None:
     assert status.json()["controller_state"] == "CONNECTED"
 
 
-def test_cli_adapter_supports_core_and_custom_commands() -> None:
-    """CLI で標準サブコマンドと JSON 引数の固有コマンドが動くこと。"""
+def test_local_cli_adapter_supports_core_and_custom_commands() -> None:
+    """ローカル CLI で標準サブコマンドと固有コマンドが動くこと。"""
     controller = AdvancedMockStationController()
-    app = create_cli_app(controller)
+    app = create_local_cli_app(controller)
     runner = CliRunner()
 
     connect = runner.invoke(app, ["connect", "COM4"])
@@ -166,3 +169,117 @@ def test_cli_adapter_supports_core_and_custom_commands() -> None:
     assert execute.stdout == '{"mock": true, "target": 6}\n'
     assert action.exit_code == 0
     assert action.stdout == '{"status": "success", "level": 5}\n'
+
+
+def test_cli_adapter_supports_service_backed_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """service-backed CLI が HTTP client として標準操作を委譲できること。"""
+    calls: list[tuple[str, str, str, Any | None]] = []
+    service_state = {
+        "controller_state": "DISCONNECTED",
+        "current_target": None,
+        "call_log": [],
+    }
+
+    def fake_request(
+        method: str,
+        server_url: str,
+        path: str,
+        payload: Any | None = None,
+    ) -> Any:
+        calls.append((method, server_url, path, payload))
+
+        if path == "/connect":
+            service_state["controller_state"] = "CONNECTED"
+            service_state["call_log"].append(f"connect({payload['address']})")
+            return {"ok": True}
+
+        if path == "/change":
+            service_state["current_target"] = payload["target"]
+            service_state["call_log"].append(f"change({payload['target']})")
+            return {"ok": True}
+
+        if path == "/execute":
+            service_state["call_log"].append("execute()")
+            return {"mock": True, "target": service_state["current_target"]}
+
+        if path == "/status":
+            return dict(service_state)
+
+        if path == "/actions/calibrate":
+            return {"status": "success", "level": payload["level"]}
+
+        raise AssertionError(f"Unexpected service path: {path}")
+
+    monkeypatch.setattr(cli_adapter, "_request_service", fake_request)
+
+    app = create_cli_app(AdvancedMockStationController())
+    runner = CliRunner()
+
+    connect = runner.invoke(app, ["--server", "http://svc.test", "connect", "COM4"])
+    change = runner.invoke(app, ["--server", "http://svc.test", "change", "6"])
+    execute = runner.invoke(app, ["--server", "http://svc.test", "execute"])
+    action = runner.invoke(
+        app,
+        [
+            "--server",
+            "http://svc.test",
+            "calibrate",
+            '{"level": 5, "force": true}',
+        ],
+    )
+    status = runner.invoke(app, ["--server", "http://svc.test", "status"])
+
+    assert connect.exit_code == 0
+    assert connect.stdout == "Connected.\n"
+    assert change.exit_code == 0
+    assert change.stdout == "Changed to 6.\n"
+    assert execute.exit_code == 0
+    assert execute.stdout == '{"mock": true, "target": 6}\n'
+    assert action.exit_code == 0
+    assert action.stdout == '{"status": "success", "level": 5}\n'
+    assert status.exit_code == 0
+    assert (
+        status.stdout
+        == '{"controller_state": "CONNECTED", "current_target": 6, '
+        '"call_log": ["connect(COM4)", "change(6)", "execute()"]}\n'
+    )
+    assert calls == [
+        ("POST", "http://svc.test", "/connect", {"address": "COM4"}),
+        ("POST", "http://svc.test", "/change", {"target": 6}),
+        ("POST", "http://svc.test", "/execute", None),
+        (
+            "POST",
+            "http://svc.test",
+            "/actions/calibrate",
+            {"level": 5, "force": True},
+        ),
+        ("GET", "http://svc.test", "/status", None),
+    ]
+
+
+def test_cli_adapter_supports_serve_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """serve が uvicorn を使って HTTP service を起動すること。"""
+    captured: dict[str, Any] = {}
+
+    class FakeUvicorn:
+        """uvicorn.run を模した最小ダブル。"""
+
+        @staticmethod
+        def run(app: Any, host: str, port: int) -> None:
+            captured["app"] = app
+            captured["host"] = host
+            captured["port"] = port
+
+    monkeypatch.setattr(cli_adapter, "import_module", lambda _name: FakeUvicorn)
+
+    app = create_cli_app(AdvancedMockStationController())
+    result = CliRunner().invoke(app, ["serve", "--host", "127.0.0.1", "--port", "9001"])
+
+    assert result.exit_code == 0
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 9001
+    assert captured["app"].title == "AdvancedMockStationController"

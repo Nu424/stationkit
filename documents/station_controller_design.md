@@ -27,7 +27,8 @@ stationkit/
 ├── adapters/
 │   ├── __init__.py
 │   ├── http.py             # create_http_app() - FastAPI ファクトリ
-│   ├── cli.py              # create_cli_app() - Typer ファクトリ
+│   ├── cli.py              # create_cli_app() - service-backed CLI
+│   ├── local_cli.py        # create_local_cli_app() - 同一プロセス向け CLI
 │   └── gui.py              # create_gui_app() - GUI ファクトリ (将来)
 ├── testing/
 │   ├── __init__.py
@@ -394,52 +395,37 @@ def create_http_app(controller: StationControllerBase) -> FastAPI:
 ```python
 # stationkit/adapters/cli.py
 import typer
-from typing import get_type_hints
 
 def create_cli_app(controller: StationControllerBase) -> typer.Typer:
     app = typer.Typer(name=type(controller).__name__)
-    target_type = _resolve_target_type(controller)
+
+    @app.callback()
+    def callback(ctx: typer.Context, server: str = "http://127.0.0.1:8000"):
+        ctx.obj = {"server_url": server}
 
     @app.command()
-    def connect(address: str):
-        controller.connect(address)
+    def serve(host: str = "127.0.0.1", port: int = 8000):
+        uvicorn.run(create_http_app(controller), host=host, port=port)
+
+    @app.command()
+    def connect(ctx: typer.Context, address: str):
+        _request_service(
+            "POST",
+            ctx.obj["server_url"],
+            "/connect",
+            {"address": address},
+        )
         typer.echo("Connected.")
 
-    @app.command()
-    def disconnect():
-        controller.disconnect()
-        typer.echo("Disconnected.")
-
-    @app.command()
-    def status():
-        typer.echo(controller.status())
-
-    @app.command()
-    def change(target: target_type):
-        controller.change(target)
-        typer.echo(f"Changed to {target}.")
-
-    @app.command()
-    def execute():
-        result = controller.execute()
-        typer.echo(result)
-
-    # --- CustomAction の自動登録 ---
-    for action in controller.get_custom_actions():
-        def _make_command(act):
-            def command(params_json: str):
-                """JSON 文字列で引数を渡す"""
-                parsed = act.input_schema.model_validate_json(params_json)
-                result = asyncio.run(act.func(parsed))
-                typer.echo(result)
-            command.__name__ = act.name
-            command.__doc__ = act.description
-            return command
-
-        app.command(name=action.name)(_make_command(action))
+    # change / execute / status / custom actions も同様に
+    # service へ HTTP で委譲する
 
     return app
 ```
+
+`create_cli_app()` は **単発 CLI を積み重ねても state を共有できるように、常駐 service に責務を寄せる** のが目的である。コントローラのインメモリ状態は `serve` で起動した service 側にあり、CLI はその薄い client になる。
+
+同一プロセス内でコントローラインスタンスを保持したいデバッグ/テスト用途には、`create_local_cli_app()` を別に用意する。
 
 ---
 
@@ -488,9 +474,13 @@ sampler = AutoSamplerDriver()
 app = create_http_app(sampler)
 # uvicorn で起動: uvicorn main:app
 
-# --- CLI として起動 ---
+# --- service + CLI client として起動 ---
 cli = create_cli_app(sampler)
-# python main.py connect COM3
+# terminal 1: python main.py serve
+# terminal 2: python main.py --server http://127.0.0.1:8000 connect COM3
+
+# --- 同一プロセス向けローカル CLI (テスト/デバッグ) ---
+local_cli = create_local_cli_app(sampler)
 
 # --- スクリプトから直接使用 (sync) ---
 sampler.connect("COM3")

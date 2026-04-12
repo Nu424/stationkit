@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.135.3",
+    "httpx>=0.28.1",
     "pydantic>=2.12.5",
     "typer>=0.24.1",
 ]
@@ -15,7 +16,6 @@ stationkit = "main:main"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.0.3",
 ]
 

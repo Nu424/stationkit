@@ -24,7 +24,7 @@ uv sync --group dev
 | 領域 | 役割 |
 |------|------|
 | `stationkit.core` | 状態・例外、`StationControllerBase`、`CustomAction` |
-| `stationkit.adapters` | `create_http_app`（FastAPI）、`create_cli_app`（Typer） |
+| `stationkit.adapters` | `create_http_app`（FastAPI）、`create_cli_app`（service + CLI client）、`create_local_cli_app`（同一プロセス向け） |
 | `stationkit.testing` | `MockStationController`（実機なしでの検証用） |
 
 ## 開発者がやること（最小）
@@ -212,6 +212,8 @@ uv run uvicorn mymodule:app --reload
 
 ## CLI として動かす
 
+`create_cli_app()` は、**常駐 service が状態を保持し、CLI は毎回その service を呼び出す** 形です。スクリプトや CI から都度コマンドを呼びつつ、`connect` 後の状態を共有したい場合はこちらを使います。
+
 ```python
 from stationkit import MyDeviceController, create_cli_app
 
@@ -221,17 +223,37 @@ if __name__ == "__main__":
     app()
 ```
 
-実行例:
+起動例（`serve` は uvicorn が必要です）:
 
 ```bash
-uv run python mycli.py connect COM3
-uv run python mycli.py change 2
-uv run python mycli.py execute
-uv run python mycli.py status
-uv run python mycli.py disconnect
+uv add uvicorn
+
+# terminal 1: service を起動
+uv run python mycli.py serve --host 127.0.0.1 --port 8000
+
+# terminal 2: CLI client から service を叩く
+uv run python mycli.py --server http://127.0.0.1:8000 connect COM3
+uv run python mycli.py --server http://127.0.0.1:8000 change 2
+uv run python mycli.py --server http://127.0.0.1:8000 execute
+uv run python mycli.py --server http://127.0.0.1:8000 status
+uv run python mycli.py --server http://127.0.0.1:8000 disconnect
 ```
 
-このリポジトリ付属のデモは `main.py` にあり、`MockStationController` をバインドしています。
+`--server` の代わりに環境変数 `STATIONKIT_SERVER_URL` でも service URL を渡せます。
+
+### 同一プロセスのローカル CLI を使う場合
+
+デバッグやテストのように、**同じ Python プロセス内で同じコントローラインスタンスを使い回す**なら `create_local_cli_app()` も使えます。こちらは `CliRunner` や独自の対話ループに埋め込む用途向けで、通常の「コマンドを 1 回ずつ起動する CLI」としては状態を共有しません。
+
+> 補足: 単発 CLI が向くのは、状態を service 側に持つ場合や、1 コマンドが `connect -> change -> execute -> disconnect` まで自己完結する場合です。逆に、接続状態をそのまま次の OS プロセスへ引き継ぎたい用途には、単発 CLI 単体は向きません。
+
+```python
+from stationkit import MyDeviceController, create_local_cli_app
+
+app = create_local_cli_app(MyDeviceController())
+```
+
+このリポジトリ付属のデモは `main.py` にあり、`MockStationController` をバインドした service-backed CLI になっています。
 
 ```bash
 uv run python main.py --help
