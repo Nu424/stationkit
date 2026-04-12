@@ -24,7 +24,7 @@ uv sync --group dev
 | 領域 | 役割 |
 |------|------|
 | `stationkit.core` | 状態・例外、`StationControllerBase`、`CustomAction` |
-| `stationkit.adapters` | `create_http_app`（FastAPI）、`create_cli_app`（service + CLI client）、`create_local_cli_app`（同一プロセス向け） |
+| `stationkit.adapters` | `create_http_app`（FastAPI）、`create_cli_app`（service + CLI client）、`create_local_cli_app`（同一プロセス向け）、`create_gui_app`（Gradio） |
 | `stationkit.testing` | `MockStationController`（実機なしでの検証用） |
 
 ## 開発者がやること（最小）
@@ -261,6 +261,28 @@ uv run python main.py --help
 
 `pyproject.toml` の `[project.scripts]` で `stationkit` コマンドも定義しているため、パッケージをインストールした環境では `stationkit` で同様に起動できます。
 
+## Gradio GUI として動かす
+
+Gradio ベースの GUI は `create_gui_app()` で生成できます。返り値は **`gr.Blocks`** なので、呼び出し側で `launch()` してください。
+
+```python
+from stationkit import MyDeviceController, create_gui_app
+
+controller = MyDeviceController()
+app = create_gui_app(controller)
+app.launch()
+```
+
+この GUI は **`create_http_app()` と同じく、1 つの controller インスタンスを共有** します。つまり、複数のブラウザクライアントが開いていても、見ている相手は同じ装置・同じ接続状態です。状態の本体は Gradio 側ではなく **controller 側** にあります。
+
+初版の入力方針は次のとおりです。
+
+- `change()` の `target` が `str` / `int` / `float` / `bool` の場合は、対応する GUI 入力ウィジェットが自動で使われます。
+- `Enum`、`list` / `dict`、`Union`、`BaseModel` などの複雑な型は、**JSON テキスト入力**にフォールバックします。
+- `CustomAction` も同様で、入力スキーマが単純なフィールド群なら個別フォーム、複雑なスキーマなら JSON テキスト入力で実行できます。
+
+GUI からの操作は共有 controller に対して逐次実行され、各操作のあとに最新の `status()` 相当の情報が画面へ再反映されます。
+
 ## テスト
 
 ```bash
@@ -276,5 +298,4 @@ uv run pytest
 
 ## 今後の拡張
 
-- `create_gui_app` は現状プレースホルダです（呼び出すと `NotImplementedError`）。
 - 詳細な設計意図は `documents/station_controller_design.md` を参照してください。

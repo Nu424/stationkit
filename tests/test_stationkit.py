@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+from threading import Lock
 from typing import Any
 
+import gradio as gr
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
 import stationkit.adapters.cli as cli_adapter
+import stationkit.adapters.gui as gui_adapter
 from stationkit import (
     ControllerState,
     CustomAction,
     create_cli_app,
+    create_gui_app,
     create_http_app,
     create_local_cli_app,
 )
@@ -44,6 +48,12 @@ class CalibrateOutput(BaseModel):
 
     status: str
     level: int
+
+
+class ComplexActionInput(BaseModel):
+    """GUI の JSON フォールバック確認用入力。"""
+
+    config: dict[str, int]
 
 
 class AdvancedMockStationController(MockStationController):
@@ -148,6 +158,72 @@ def test_http_adapter_exposes_core_and_custom_actions() -> None:
     assert execute.json() == {"mock": True, "target": 2}
     assert action.json() == {"status": "success", "level": 7}
     assert status.json()["controller_state"] == "CONNECTED"
+
+
+def test_gui_adapter_builds_blocks() -> None:
+    """GUI アダプタが Gradio Blocks を返せること。"""
+    app = create_gui_app(AdvancedMockStationController())
+
+    assert isinstance(app, gr.Blocks)
+
+
+def test_gui_handlers_share_controller_state_and_refresh_status() -> None:
+    """GUI helper が同一 controller を共有し、最新状態を返すこと。"""
+    controller = MockStationController()
+    operation_lock = Lock()
+
+    connect = gui_adapter._build_connect_handler(controller, operation_lock)
+    change = gui_adapter._build_change_handler(controller, operation_lock, int)
+    execute = gui_adapter._build_execute_handler(controller, operation_lock)
+
+    connect_message, connect_result, connect_status = asyncio.run(connect("COM7"))
+    change_message, change_result, change_status = asyncio.run(change(3))
+    execute_message, execute_result, execute_status = asyncio.run(execute())
+
+    assert connect_message == "Connected."
+    assert connect_result is None
+    assert connect_status["controller_state"] == "CONNECTED"
+
+    assert change_message == "Target changed."
+    assert change_result is None
+    assert change_status["current_target"] == 3
+
+    assert execute_message == "Execution completed."
+    assert execute_result == {"mock": True, "target": 3}
+    assert execute_status["controller_state"] == "CONNECTED"
+    assert controller.call_log == [
+        "connect(COM7)",
+        "change(3)",
+        "execute()",
+    ]
+
+
+def test_gui_value_coercion_supports_scalar_and_json_fallback() -> None:
+    """GUI helper が単純型と JSON フォールバックを扱えること。"""
+    assert gui_adapter._coerce_value(5.0, int) == 5
+    assert gui_adapter._coerce_value("hello", str) == "hello"
+    assert gui_adapter._coerce_value('{"config": {"slot": 2}}', ComplexActionInput) == (
+        ComplexActionInput(config={"slot": 2})
+    )
+
+
+def test_gui_custom_action_helpers_support_field_and_json_inputs() -> None:
+    """CustomAction 入力 helper が field widget と JSON の両方を扱えること。"""
+    assert gui_adapter._input_schema_uses_field_widgets(CalibrateInput) is True
+    bindings = gui_adapter._build_field_bindings(CalibrateInput)
+    parsed_fields = gui_adapter._parse_action_fields(
+        input_schema=CalibrateInput,
+        field_bindings=bindings,
+        raw_values=(5.0, True),
+    )
+    assert parsed_fields == CalibrateInput(level=5, force=True)
+
+    assert gui_adapter._input_schema_uses_field_widgets(ComplexActionInput) is False
+    parsed_json = gui_adapter._parse_action_json(
+        ComplexActionInput,
+        '{"config": {"slot": 4}}',
+    )
+    assert parsed_json == ComplexActionInput(config={"slot": 4})
 
 
 def test_local_cli_adapter_supports_core_and_custom_commands() -> None:

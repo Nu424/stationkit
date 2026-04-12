@@ -1,17 +1,800 @@
-"""GUI アダプタ（未実装のプレースホルダ）。"""
+"""Gradio ベースの GUI アダプタ。
 
-from stationkit.core import StationControllerBase
+単一の :class:`~stationkit.core.base.StationControllerBase` を全クライアントで共有し、
+接続・切替・実行および :class:`~stationkit.core.action.CustomAction` を Gradio から操作する。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from threading import Lock
+from types import NoneType, UnionType
+from typing import Any, Union, get_args, get_origin
+
+import gradio as gr
+from pydantic import BaseModel, TypeAdapter
+from pydantic.fields import FieldInfo
+
+from stationkit.adapters._shared import normalize_result, resolve_target_type
+from stationkit.core import CustomAction, StationControllerBase
+
+# -----------------------------------------------------------------------------
+# データ構造（UI バインディング）
+# -----------------------------------------------------------------------------
 
 
-def create_gui_app(_controller: StationControllerBase) -> None:
-    """GUI アプリケーションを生成する（予定）。
+@dataclass(slots=True)
+class _FieldBinding:
+    """CustomAction の入力フィールドと Gradio ウィジェットの対応。
 
-    現状は未実装。将来 Tkinter や Web UI 等で提供する想定。
+    Attributes:
+        name: 入力モデル上のフィールド名。
+        annotation: フィールドの型注釈（Gradio コンポーネント選択と :func:`_coerce_value` に使用）。
+        label: ウィジェットに表示するラベル。
+        default: 初期表示用のデフォルト値。必須フィールドの場合は ``None``。
+    """
+
+    name: str
+    annotation: Any
+    label: str
+    default: Any
+
+
+# -----------------------------------------------------------------------------
+# パブリック API
+# -----------------------------------------------------------------------------
+
+
+def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
+    """コントローラ用の Gradio GUI（:class:`gradio.Blocks`）を組み立てる。
+
+    ``create_http_app()`` と同様、渡された **1 つの** ``controller`` を GUI 全体で共有する。
+    状態の本体は controller 側にあり、各操作後に ``status_async()`` で最新表示を更新する。
 
     Args:
-        _controller: バインドするコントローラ（未使用）。
+        controller: バインドするコントローラインスタンス。
+
+    Returns:
+        コンポーネントとイベントが登録済みの :class:`gradio.Blocks`。呼び出し側で ``launch()`` する。
+
+    Note:
+        共有 controller への同時アクセスを避けるため、操作は内部の ``threading.Lock`` で逐次化する。
+    """
+    target_type = resolve_target_type(controller)
+    operation_lock = Lock()
+    custom_actions = controller.get_custom_actions()
+
+    with gr.Blocks(title=f"{type(controller).__name__} GUI") as app:
+        # --- ヘッダ・説明 ---
+        gr.Markdown(f"# {type(controller).__name__} GUI")
+        gr.Markdown(
+            "A shared controller instance is bound to this GUI. "
+            "All clients operate on the same device state."
+        )
+
+        # --- 接続・切断・ステータス更新 ---
+        with gr.Row():
+            address_input = gr.Textbox(
+                label="Address",
+                placeholder="COM3 / tcp://host / device-specific address",
+            )
+            connect_button = gr.Button("Connect", variant="primary")
+            disconnect_button = gr.Button("Disconnect")
+            refresh_button = gr.Button("Refresh Status")
+
+        # --- コア操作（change / execute）---
+        with gr.Group():
+            gr.Markdown("## Core Operations")
+            with gr.Row():
+                target_component = _create_value_component(
+                    target_type,
+                    label="Target",
+                    default=None,
+                )
+                change_button = gr.Button("Change")
+                execute_button = gr.Button("Execute", variant="secondary")
+
+        # --- CustomAction セクション見出し ---
+        if custom_actions:
+            gr.Markdown("## Custom Actions")
+
+        # --- 出力パネル（メッセージ・結果・状態）---
+        message_output = gr.Textbox(label="Message", lines=3, interactive=False)
+        result_output = gr.JSON(label="Result")
+        status_output = gr.JSON(label="Status")
+
+        # --- イベント登録：標準操作 ---
+        connect_button.click(
+            fn=_build_connect_handler(controller, operation_lock),
+            inputs=[address_input],
+            outputs=[message_output, result_output, status_output],
+        )
+        disconnect_button.click(
+            fn=_build_disconnect_handler(controller, operation_lock),
+            outputs=[message_output, result_output, status_output],
+        )
+        refresh_button.click(
+            fn=_build_refresh_handler(controller, operation_lock),
+            outputs=[message_output, result_output, status_output],
+        )
+        change_button.click(
+            fn=_build_change_handler(controller, operation_lock, target_type),
+            inputs=[target_component],
+            outputs=[message_output, result_output, status_output],
+        )
+        execute_button.click(
+            fn=_build_execute_handler(controller, operation_lock),
+            outputs=[message_output, result_output, status_output],
+        )
+
+        # --- イベント登録：CustomAction ---
+        for action in custom_actions:
+            _render_custom_action(
+                action=action,
+                controller=controller,
+                operation_lock=operation_lock,
+                outputs=[message_output, result_output, status_output],
+            )
+
+        # --- 初期表示：ステータス読み込み ---
+        app.load(
+            fn=_build_refresh_handler(controller, operation_lock),
+            outputs=[message_output, result_output, status_output],
+        )
+
+    return app
+
+
+# -----------------------------------------------------------------------------
+# CustomAction 用 UI 構築
+# -----------------------------------------------------------------------------
+
+
+def _render_custom_action(
+    action: CustomAction,
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    outputs: list[gr.Component],
+) -> None:
+    """1 件の CustomAction について、アコーディオン内に入力 UI と実行ボタンを追加する。
+
+    入力スキーマが単純スカラー型のフィールドのみならフィールドごとにウィジェットを生成し、
+    それ以外は JSON テキスト 1 本で入力する。
+
+    Args:
+        action: 登録する固有操作のメタデータ。
+        controller: 共有コントローラ。
+        operation_lock: 操作の逐次化に使うロック。
+        outputs: クリック時に更新する Gradio 出力コンポーネント（message / result / status）。
+    """
+    with gr.Accordion(f"{action.name}: {action.description}", open=False):
+        # ---入力スキーマがGradio標準の単一ウィジェットで表現できる場合は、それを使用する
+        if _input_schema_uses_field_widgets(action.input_schema):
+            field_bindings = _build_field_bindings(action.input_schema)
+            inputs = [
+                _create_value_component(
+                    field.annotation,
+                    label=field.label,
+                    default=field.default,
+                )
+                for field in field_bindings
+            ]
+            if not inputs:
+                gr.Markdown("No parameters.")
+            run_button = gr.Button(f"Run {action.name}")
+            run_button.click(
+                fn=_build_action_fields_handler(
+                    controller=controller,
+                    operation_lock=operation_lock,
+                    action=action,
+                    field_bindings=field_bindings,
+                ),
+                inputs=inputs,
+                outputs=outputs,
+            )
+            return
+
+        # ---入力スキーマがGradio標準の単一ウィジェットで表現できない場合は、JSONテキスト1本で入力する
+        params_input = gr.Textbox(
+            label="Parameters (JSON)",
+            lines=6,
+            placeholder='{"field": "value"}',
+        )
+        run_button = gr.Button(f"Run {action.name}")
+        run_button.click(
+            fn=_build_action_json_handler(
+                controller=controller,
+                operation_lock=operation_lock,
+                action=action,
+            ),
+            inputs=[params_input],
+            outputs=outputs,
+        )
+
+
+# -----------------------------------------------------------------------------
+# Gradio イベントハンドラの生成（標準操作）
+# -----------------------------------------------------------------------------
+
+
+def _build_connect_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+) -> Callable[[str], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """「接続」ボタン用の非同期ハンドラを返す。
+
+    Args:
+        controller: 共有コントローラ。
+        operation_lock: 操作の逐次化に使うロック。
+
+    Returns:
+        ``address: str`` を受け取り、``(message, result, status)`` のタプルを返すコルーチン。
+        ``result`` は接続操作では常に ``None``。
+    """
+
+    async def handle_connect(address: str) -> tuple[str, Any, dict[str, Any]]:
+        async def connect() -> None:
+            await controller.connect_async(address)
+
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=connect,
+            success_message="Connected.",
+        )
+
+    return handle_connect
+
+
+def _build_disconnect_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """「切断」ボタン用の非同期ハンドラを返す。
+
+    Args:
+        controller: 共有コントローラ。
+        operation_lock: 操作の逐次化に使うロック。
+
+    Returns:
+        引数なしで ``(message, result, status)`` を返すコルーチン。
+        ``result`` は切断操作では常に ``None``。
+    """
+
+    async def handle_disconnect() -> tuple[str, Any, dict[str, Any]]:
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=controller.disconnect_async,
+            success_message="Disconnected.",
+        )
+
+    return handle_disconnect
+
+
+def _build_refresh_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """「ステータス更新」および初期 ``load`` 用の非同期ハンドラを返す。
+
+    controller への副作用はなく、最新の ``status_async()`` の結果だけを表示する。
+
+    Args:
+        controller: 共有コントローラ。
+        operation_lock: 操作の逐次化に使うロック。
+
+    Returns:
+        引数なしで ``(message, result, status)`` を返すコルーチン。
+        ``result`` は常に ``None``。
+    """
+
+    async def handle_refresh() -> tuple[str, Any, dict[str, Any]]:
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=_noop_async,
+            success_message="Status refreshed.",
+        )
+
+    return handle_refresh
+
+
+def _build_change_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    target_type: Any,
+) -> Callable[[Any], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """「切替」ボタン用の非同期ハンドラを返す。
+
+    Args:
+        controller: 共有コントローラ。
+        operation_lock: 操作の逐次化に使うロック。
+        target_type: ``resolve_target_type`` で得た ``change`` の引数型。
+
+    Returns:
+        生のウィジェット値を受け取り、:func:`_coerce_value` で変換してから
+        ``change_async`` を呼び、``(message, result, status)`` を返すコルーチン。
+        ``result`` は切替操作では常に ``None``。
+    """
+
+    async def handle_change(raw_target: Any) -> tuple[str, Any, dict[str, Any]]:
+        async def change() -> None:
+            target = _coerce_value(raw_target, target_type)
+            await controller.change_async(target)
+
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=change,
+            success_message="Target changed.",
+        )
+
+    return handle_change
+
+
+def _build_execute_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """「実行」ボタン用の非同期ハンドラを返す。
+
+    Args:
+        controller: 共有コントローラ。
+        operation_lock: 操作の逐次化に使うロック。
+
+    Returns:
+        引数なしで ``execute_async`` を実行し、戻り値を正規化した ``result`` と
+        最新 ``status`` を含む ``(message, result, status)`` を返すコルーチン。
+    """
+
+    async def handle_execute() -> tuple[str, Any, dict[str, Any]]:
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=controller.execute_async,
+            success_message="Execution completed.",
+            include_result=True,
+        )
+
+    return handle_execute
+
+
+# -----------------------------------------------------------------------------
+# Gradio イベントハンドラの生成（CustomAction）
+# -----------------------------------------------------------------------------
+
+
+def _build_action_fields_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    action: CustomAction,
+    field_bindings: list[_FieldBinding],
+) -> Callable[..., Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """フィールド分割ウィジェットから CustomAction を実行するハンドラを返す。
+
+    Args:
+        controller: 共有コントローラ（ロック共有のため渡す。action 自体は controller 非依存でも可）。
+        operation_lock: 操作の逐次化に使うロック。
+        action: 実行する CustomAction。
+        field_bindings: ウィジェット順とフィールドの対応。
+
+    Returns:
+        ウィジェット値を可変長で受け取り、:func:`_parse_action_fields` 後に ``action.func`` を
+        await し、``(message, result, status)`` を返すコルーチン。
+    """
+
+    async def handle_action(*raw_values: Any) -> tuple[str, Any, dict[str, Any]]:
+        # ---共通のハンドラで実行する用のasync関数を定義する
+        async def run_action() -> Any:
+            # ---ウィジェットから得た値(raw_values)を、入力スキーマに合わせて検証・変換する
+            params = _parse_action_fields(
+                input_schema=action.input_schema,
+                field_bindings=field_bindings,
+                raw_values=raw_values,
+            )
+            return await action.func(params)
+
+        # ---実行は共通のハンドラで
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=run_action,
+            success_message=f"Action '{action.name}' completed.",
+            include_result=True,
+        )
+
+    return handle_action
+
+
+def _build_action_json_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    action: CustomAction,
+) -> Callable[[str], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """JSON テキストから CustomAction を実行するハンドラを返す。
+
+    Args:
+        controller: 共有コントローラ（ロック共有のため渡す）。
+        operation_lock: 操作の逐次化に使うロック。
+        action: 実行する CustomAction。
+
+    Returns:
+        JSON 文字列を受け取り、:func:`_parse_action_json` 後に ``action.func`` を await し、
+        ``(message, result, status)`` を返すコルーチン。
+    """
+
+    async def handle_action(params_json: str) -> tuple[str, Any, dict[str, Any]]:
+        async def run_action() -> Any:
+            params = _parse_action_json(action.input_schema, params_json)
+            return await action.func(params)
+
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=run_action,
+            success_message=f"Action '{action.name}' completed.",
+            include_result=True,
+        )
+
+    return handle_action
+
+
+# -----------------------------------------------------------------------------
+# 共有 controller 上の 1 操作の実行と排他
+# -----------------------------------------------------------------------------
+
+
+async def _run_controller_action(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    operation: Callable[[], Awaitable[Any]],
+    success_message: str,
+    include_result: bool = False,
+) -> tuple[str, Any, dict[str, Any]]:
+    """ロック下で ``operation`` を 1 回実行し、メッセージ・結果・状態をまとめて返す。
+
+    成功時は ``success_message`` と、必要なら ``normalize_result`` 済みの結果、
+    および ``status_async()`` 相当の dict を返す。失敗時はエラー文字列と ``result=None``、
+    可能なら取得した状態 dict を返す。
+
+    Args:
+        controller: 状態取得に使う共有コントローラ。
+        operation_lock: 逐次化用の ``threading.Lock``。
+        operation: 引数なしの async 操作（例: ``controller.disconnect_async``）。
+        success_message: 成功時に UI に表示するメッセージ。
+        include_result: True のとき ``operation`` の戻り値を ``normalize_result`` して返す。
+
+    Returns:
+        ``(message, result, status)``。``result`` は ``include_result`` が False のとき ``None``。
+    """
+    async with _hold_lock(operation_lock):
+        try:
+            result = await operation()
+            status = await _safe_status(controller)
+        except Exception as exc:
+            status = await _safe_status(controller)
+            return f"Error: {exc}", None, status
+
+    display_result = normalize_result(result) if include_result else None
+    return success_message, display_result, status
+
+
+# -----------------------------------------------------------------------------
+# CustomAction 入力スキーマの解釈
+# -----------------------------------------------------------------------------
+
+
+def _input_schema_uses_field_widgets(input_schema: type[BaseModel]) -> bool:
+    """入力スキーマの全フィールドが「単一ウィジェット対応型」かどうかを返す。
+
+    Args:
+        input_schema: CustomAction の ``input_schema``。
+
+    Returns:
+        すべてのフィールドが :func:`_supports_native_component` を満たすとき True。
+    """
+    return all(
+        _supports_native_component(field.annotation)
+        for field in input_schema.model_fields.values()
+    )
+
+
+def _build_field_bindings(input_schema: type[BaseModel]) -> list[_FieldBinding]:
+    """Pydantic モデルの各フィールドから :class:`_FieldBinding` のリストを作る。
+
+    Args:
+        input_schema: CustomAction の ``input_schema``。
+
+    Returns:
+        ``model_fields`` の定義順に並べたバインディング一覧。
+    """
+    bindings: list[_FieldBinding] = []
+    for name, field in input_schema.model_fields.items():
+        bindings.append(
+            _FieldBinding(
+                name=name,
+                annotation=field.annotation,
+                label=field.title or name,
+                default=_field_default(field),
+            )
+        )
+    return bindings
+
+
+def _parse_action_fields(
+    input_schema: type[BaseModel],
+    field_bindings: list[_FieldBinding],
+    raw_values: tuple[Any, ...],
+) -> BaseModel:
+    """ウィジェットから得た値をフィールド名付き dict にし、入力モデルを検証する。
+
+    Args:
+        input_schema: 検証に使う Pydantic モデル。
+        field_bindings: フィールドとウィジェット順の対応。
+        raw_values: Gradio から渡る値のタプル（``field_bindings`` と同じ長さであること）。
+
+    Returns:
+        ``input_schema`` の検証済みインスタンス。
 
     Raises:
-        NotImplementedError: 常に送出される。
+        ValueError: :func:`_coerce_value` 内で JSON 解析などに失敗した場合。
+        pydantic.ValidationError: モデル検証に失敗した場合。
     """
-    raise NotImplementedError("GUI adapter is not implemented yet.")
+    payload = {
+        binding.name: _coerce_value(raw_value, binding.annotation) # 生の値を型に合わせて検証・変換する
+        for binding, raw_value in zip(field_bindings, raw_values, strict=True)
+    }
+    return input_schema.model_validate(payload)
+
+
+def _parse_action_json(
+    input_schema: type[BaseModel],
+    params_json: str,
+) -> BaseModel:
+    """JSON 文字列をパースして入力モデルを検証する。
+
+    空文字（空白のみ）のときは空オブジェクト ``{}`` として扱う。
+
+    Args:
+        input_schema: 検証に使う Pydantic モデル。
+        params_json: ユーザーが入力した JSON テキスト。
+
+    Returns:
+        ``input_schema`` の検証済みインスタンス。
+
+    Raises:
+        ValueError: JSON の構文が不正な場合。
+        pydantic.ValidationError: モデル検証に失敗した場合。
+    """
+    text = params_json.strip()
+    if not text:
+        payload: Any = {}
+    else:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON input: {exc}") from exc
+    return input_schema.model_validate(payload)
+
+
+# -----------------------------------------------------------------------------
+# 型に応じた Gradio コンポーネントと値の変換
+# -----------------------------------------------------------------------------
+
+
+def _create_value_component(
+    value_type: Any,
+    label: str,
+    default: Any,
+) -> gr.Component:
+    """型に応じて Checkbox / Number / Textbox（または JSON 用 Textbox）を生成する。
+
+    Args:
+        value_type: 対象の Python 型（``Optional`` は :func:`_unwrap_optional` で解釈）。
+        label: コンポーネントのラベル。
+        default: 初期値。未設定のときは型に応じて空欄や False を使う。
+
+    Returns:
+        対応する Gradio 入力コンポーネント。
+    """
+    base_type, is_optional = _unwrap_optional(value_type)
+
+    # ---各種型に合わせて、対応するGradioコンポーネントを生成する
+    if base_type is bool and not is_optional: # boolはT/Fしか持てず、Noneを表現できないので、not is_optionalにしている
+        return gr.Checkbox(label=label, value=bool(default) if default is not None else False)
+
+    if base_type is int:
+        value = None if default is None else int(default)
+        return gr.Number(label=label, value=value, precision=0)
+
+    if base_type is float:
+        value = None if default is None else float(default)
+        return gr.Number(label=label, value=value)
+
+    if base_type is str:
+        value = "" if default is None else str(default)
+        return gr.Textbox(label=label, value=value)
+
+    # ---どれでもない場合は、複雑型用のTextboxを生成する
+    placeholder = _json_placeholder(base_type)
+    return gr.Textbox(
+        label=f"{label} (JSON)",
+        lines=6,
+        value=_json_default(default),
+        placeholder=placeholder,
+    )
+
+
+def _coerce_value(raw_value: Any, value_type: Any) -> Any:
+    """Gradio から渡された生の値を ``value_type`` に合わせて検証・変換する。
+
+    単一ウィジェット型は :class:`pydantic.TypeAdapter` でそのまま検証する。
+    複雑型で文字列が来た場合は JSON としてパースしてから検証する。
+
+    Args:
+        raw_value: ウィジェットの値。
+        value_type: 期待する型（``Optional`` 可）。
+
+    Returns:
+        ``TypeAdapter(value_type).validate_python(...)`` の結果。
+
+    Raises:
+        ValueError: JSON として解釈すべき文字列が不正な場合（メッセージ内に元の型を含む）。
+        pydantic.ValidationError: 型検証に失敗した場合。
+    """
+    # ---TypeAdapterは、オブジェクトが特定の型に合致するかを検証するやつ
+    adapter = TypeAdapter(value_type)
+    # ---値の型がGradio標準の単一ウィジェットで表現できる型の場合は、そのままvalidateする
+    if _supports_native_component(value_type):
+        return adapter.validate_python(raw_value)
+
+    # ---表現できず、値の型がstr型でもない場合は、そのままTypeAdapterでvalidateする
+    if not isinstance(raw_value, str):
+        return adapter.validate_python(raw_value)
+
+    # ---表現できないけどstr型の場合は、JSONとしてパースする
+    text = raw_value.strip()
+    if not text:
+        return adapter.validate_python(None)
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Expected JSON input for {value_type!r}: {exc}") from exc
+    return adapter.validate_python(payload)
+
+
+def _supports_native_component(value_type: Any) -> bool:
+    """``str`` / ``int`` / ``float`` / 非 Optional ``bool`` をGradio標準の単一ウィジェットで表現できるか。
+
+    Args:
+        value_type: 判定する型注釈。
+
+    Returns:
+        上記に該当し、かつ ``Optional[bool]`` でないとき True。
+    """
+    base_type, is_optional = _unwrap_optional(value_type)
+    if is_optional and base_type is bool:
+        return False
+    return base_type in {str, int, float, bool}
+
+
+def _unwrap_optional(value_type: Any) -> tuple[Any, bool]:
+    """``Union[T, None]`` 形式を ``T`` と optional フラグに分解する。
+
+    Args:
+        value_type: 分解する型注釈。
+
+    Returns:
+        ``(実体型, is_optional)``。Union でない場合は ``(value_type, False)``。
+    """
+    origin = get_origin(value_type)
+    if origin not in {Union, UnionType}:
+        return value_type, False
+    args = get_args(value_type)
+    non_none_args = [arg for arg in args if arg is not NoneType]
+    # 全args数とnon_none_args数が一致しない場合は、一部がNoneTypeであり、optionalであることを示す
+    if len(non_none_args) == 1 and len(non_none_args) != len(args):
+        return non_none_args[0], True
+    return value_type, False
+
+
+def _field_default(field: FieldInfo) -> Any:
+    """Pydantic v2 のフィールドからデフォルト値を取得する。
+
+    Args:
+        field: ``model_fields`` の値。
+
+    Returns:
+        必須フィールドなら ``None``。それ以外は ``get_default`` の結果。
+    """
+    if field.is_required():
+        return None
+    return field.get_default(call_default_factory=True)
+
+
+def _json_default(default: Any) -> str:
+    """複雑型用 Textbox の初期文字列を JSON で返す。
+
+    Args:
+        default: デフォルト値。``None`` なら空文字。
+
+    Returns:
+        ``normalize_result`` 後に ``json.dumps`` した UTF-8 文字列。
+    """
+    if default is None:
+        return ""
+    return json.dumps(normalize_result(default), ensure_ascii=False, indent=2)
+
+
+def _json_placeholder(value_type: Any) -> str:
+    """複雑型用 Textbox のプレースホルダ文字列を返す。
+
+    Args:
+        value_type: 入力対象型。``BaseModel`` サブクラスならスキーマの title を利用する。
+
+    Returns:
+        プレースホルダ用の短い文字列。
+    """
+    if isinstance(value_type, type) and issubclass(value_type, BaseModel):
+        return value_type.model_json_schema().get("title", "{}")
+    return "Enter JSON here"
+
+
+# -----------------------------------------------------------------------------
+# 状態取得とロック（逐次化）
+# -----------------------------------------------------------------------------
+
+
+async def _safe_status(controller: StationControllerBase) -> dict[str, Any]:
+    """``status_async()`` を呼び、失敗時も最低限の dict を返す。
+
+    Args:
+        controller: 状態を問い合わせるコントローラ。
+
+    Returns:
+        成功時は ``status_async()`` の戻り値。失敗時は ``controller_state`` と
+        ``status_error`` キーを含む dict。
+    """
+    try:
+        return await controller.status_async()
+    except Exception as exc:
+        return {
+            "controller_state": controller.state.name,
+            "status_error": str(exc),
+        }
+
+
+async def _noop_async() -> None:
+    """何もしない async コルーチン。
+
+    ステータス更新のみ行う経路で ``operation`` 引数を満たすために使う。
+    """
+    return None
+
+
+@asynccontextmanager
+async def _hold_lock(operation_lock: Lock):
+    """``threading.Lock`` をイベントループをブロックせずに取得・解放するコンテキスト。
+
+    ``asyncio.to_thread`` でロック取得を別スレッドに逃がし、UI スレッドのブロックを避ける。
+
+    Args:
+        operation_lock: 共有する ``threading.Lock``。
+
+    Yields:
+        ロック取得済みの区間。
+
+    Note:
+        解放は ``finally`` で必ず行う。
+    """
+    await asyncio.to_thread(operation_lock.acquire)
+    try:
+        yield
+    finally:
+        operation_lock.release()
