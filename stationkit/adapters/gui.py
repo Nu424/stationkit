@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from threading import Lock
+from time import perf_counter
 from types import NoneType, UnionType
 from typing import Any, Union, get_args, get_origin
 
@@ -19,8 +20,17 @@ import gradio as gr
 from pydantic import BaseModel, TypeAdapter
 from pydantic.fields import FieldInfo
 
+from stationkit._logging import (
+    get_adapter_logger,
+    log_operation_failure,
+    log_operation_start,
+    log_operation_success,
+)
 from stationkit.adapters._shared import normalize_result, resolve_target_type
 from stationkit.core import CustomAction, StationControllerBase
+from stationkit.core.introspection import ExecuteParamsSpec, resolve_execute_params_spec
+
+LOGGER = get_adapter_logger("gui")
 
 # -----------------------------------------------------------------------------
 # データ構造（UI バインディング）
@@ -65,8 +75,10 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
         共有 controller への同時アクセスを避けるため、操作は内部の ``threading.Lock`` で逐次化する。
     """
     target_type = resolve_target_type(controller)
+    execute_params_spec = resolve_execute_params_spec(controller)
     operation_lock = Lock()
     custom_actions = controller.get_custom_actions()
+    execute_inputs: list[gr.Component] = []
 
     with gr.Blocks(title=f"{type(controller).__name__} GUI") as app:
         # --- ヘッダ・説明 ---
@@ -97,6 +109,8 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
                 )
                 change_button = gr.Button("Change")
                 execute_button = gr.Button("Execute", variant="secondary")
+            # ---executeの入力仕様に応じて、Gradioコンポーネントを生成する
+            execute_inputs = _render_execute_inputs(execute_params_spec)
 
         # --- CustomAction セクション見出し ---
         if custom_actions:
@@ -127,7 +141,8 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
             outputs=[message_output, result_output, status_output],
         )
         execute_button.click(
-            fn=_build_execute_handler(controller, operation_lock),
+            fn=_build_execute_handler(controller, operation_lock, execute_params_spec),
+            inputs=execute_inputs,
             outputs=[message_output, result_output, status_output],
         )
 
@@ -216,6 +231,41 @@ def _render_custom_action(
         )
 
 
+def _render_execute_inputs(params_spec: ExecuteParamsSpec) -> list[gr.Component]:
+    """execute 入力モデルに応じて GUI コンポーネントを生成する。"""
+    # ---executeのパラメータがない場合は、空リストを返す
+    if not params_spec.accepts_params:
+        return []
+
+    model_type = params_spec.model_type
+    if model_type is None:
+        raise TypeError("execute parameter spec is missing model type")
+
+    # ---executeのパラメータがウィジェットで表現できる場合は、ウィジェットを生成する
+    if _input_schema_uses_field_widgets(model_type):
+        bindings = _build_field_bindings(model_type)
+        if not bindings:
+            return []
+        with gr.Row():
+            # ---_FieldBindingをもとに、ウィジェットを生成する
+            return [
+                _create_value_component(
+                    field.annotation,
+                    label=field.label,
+                    default=field.default,
+                )
+                for field in bindings
+            ]
+
+    # ---executeのパラメータがウィジェットで表現できない場合は、JSONテキスト1本で入力する
+    params_input = gr.Textbox(
+        label="Execute Parameters (JSON)",
+        lines=6,
+        placeholder='{"field": "value"}',
+    )
+    return [params_input]
+
+
 # -----------------------------------------------------------------------------
 # Gradio イベントハンドラの生成（標準操作）
 # -----------------------------------------------------------------------------
@@ -244,7 +294,9 @@ def _build_connect_handler(
             controller=controller,
             operation_lock=operation_lock,
             operation=connect,
+            operation_name="connect",
             success_message="Connected.",
+            log_context={"address_provided": bool(address)},
         )
 
     return handle_connect
@@ -270,6 +322,7 @@ def _build_disconnect_handler(
             controller=controller,
             operation_lock=operation_lock,
             operation=controller.disconnect_async,
+            operation_name="disconnect",
             success_message="Disconnected.",
         )
 
@@ -298,6 +351,7 @@ def _build_refresh_handler(
             controller=controller,
             operation_lock=operation_lock,
             operation=_noop_async,
+            operation_name="status",
             success_message="Status refreshed.",
         )
 
@@ -331,7 +385,9 @@ def _build_change_handler(
             controller=controller,
             operation_lock=operation_lock,
             operation=change,
+            operation_name="change",
             success_message="Target changed.",
+            log_context={"target_type": target_type.__name__},
         )
 
     return handle_change
@@ -340,7 +396,8 @@ def _build_change_handler(
 def _build_execute_handler(
     controller: StationControllerBase,
     operation_lock: Lock,
-) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    params_spec: ExecuteParamsSpec,
+) -> Callable[..., Awaitable[tuple[str, Any, dict[str, Any]]]]:
     """「実行」ボタン用の非同期ハンドラを返す。
 
     Args:
@@ -348,17 +405,24 @@ def _build_execute_handler(
         operation_lock: 操作の逐次化に使うロック。
 
     Returns:
-        引数なしで ``execute_async`` を実行し、戻り値を正規化した ``result`` と
-        最新 ``status`` を含む ``(message, result, status)`` を返すコルーチン。
+        execute 入力 UI から得た値を受け取り、``execute_async`` を実行して
+        戻り値を正規化した ``result`` と最新 ``status`` を返すコルーチン。
     """
+    async def handle_execute(*raw_values: Any) -> tuple[str, Any, dict[str, Any]]:
+        async def execute() -> Any:
+            # ---executeの入力仕様に応じて、値をパースする
+            params = _parse_execute_input(params_spec, raw_values)
+            # ---executeを実行する
+            return await controller.execute_async(params)
 
-    async def handle_execute() -> tuple[str, Any, dict[str, Any]]:
         return await _run_controller_action(
             controller=controller,
             operation_lock=operation_lock,
-            operation=controller.execute_async,
+            operation=execute,
+            operation_name="execute",
             success_message="Execution completed.",
             include_result=True,
+            log_context={"input_arity": len(raw_values)},
         )
 
     return handle_execute
@@ -404,8 +468,10 @@ def _build_action_fields_handler(
             controller=controller,
             operation_lock=operation_lock,
             operation=run_action,
+            operation_name=action.name,
             success_message=f"Action '{action.name}' completed.",
             include_result=True,
+            log_context={"has_params": True},
         )
 
     return handle_action
@@ -437,8 +503,10 @@ def _build_action_json_handler(
             controller=controller,
             operation_lock=operation_lock,
             operation=run_action,
+            operation_name=action.name,
             success_message=f"Action '{action.name}' completed.",
             include_result=True,
+            log_context={"has_params": True},
         )
 
     return handle_action
@@ -453,8 +521,10 @@ async def _run_controller_action(
     controller: StationControllerBase,
     operation_lock: Lock,
     operation: Callable[[], Awaitable[Any]],
+    operation_name: str,
     success_message: str,
     include_result: bool = False,
+    log_context: dict[str, Any] | None = None,
 ) -> tuple[str, Any, dict[str, Any]]:
     """ロック下で ``operation`` を 1 回実行し、メッセージ・結果・状態をまとめて返す。
 
@@ -472,14 +542,40 @@ async def _run_controller_action(
     Returns:
         ``(message, result, status)``。``result`` は ``include_result`` が False のとき ``None``。
     """
+    context = log_context or {}
+    started = perf_counter()
+    log_operation_start(
+        LOGGER,
+        layer="gui",
+        operation_name=operation_name,
+        controller_name=type(controller).__name__,
+        context=context,
+    )
     async with _hold_lock(operation_lock):
         try:
             result = await operation()
             status = await _safe_status(controller)
         except Exception as exc:
             status = await _safe_status(controller)
+            log_operation_failure(
+                LOGGER,
+                layer="gui",
+                operation_name=operation_name,
+                controller_name=type(controller).__name__,
+                duration_ms=(perf_counter() - started) * 1000,
+                context=context,
+                exc=exc,
+            )
             return f"Error: {exc}", None, status
 
+    log_operation_success(
+        LOGGER,
+        layer="gui",
+        operation_name=operation_name,
+        controller_name=type(controller).__name__,
+        duration_ms=(perf_counter() - started) * 1000,
+        context=context,
+    )
     display_result = normalize_result(result) if include_result else None
     return success_message, display_result, status
 
@@ -506,6 +602,7 @@ def _input_schema_uses_field_widgets(input_schema: type[BaseModel]) -> bool:
 
 def _build_field_bindings(input_schema: type[BaseModel]) -> list[_FieldBinding]:
     """Pydantic モデルの各フィールドから :class:`_FieldBinding` のリストを作る。
+    Pydanticスキーマをforで解析して、_FieldBindingの構造に変換してるだけ。
 
     Args:
         input_schema: CustomAction の ``input_schema``。
@@ -580,6 +677,50 @@ def _parse_action_json(
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid JSON input: {exc}") from exc
     return input_schema.model_validate(payload)
+
+
+def _parse_execute_input(
+    params_spec: ExecuteParamsSpec,
+    raw_values: tuple[Any, ...],
+) -> BaseModel | None:
+    """execute 入力ウィジェットの値を controller に渡す値へ変換する。
+    
+    Args:
+        params_spec: execute 入力仕様。
+        raw_values: Gradio から渡る値のタプル（``field_bindings`` と同じ長さであること）。
+
+    Returns:
+        ``input_schema`` の検証済みインスタンス。
+    """
+    if not params_spec.accepts_params:
+        return None
+
+    model_type = params_spec.model_type
+    if model_type is None:
+        raise TypeError("execute parameter spec is missing model type")
+
+    # ---入力のすべてがウィジェットで表現できている場合は、入力フィールドの生値を、Pydanticモデルに変換する
+    if _input_schema_uses_field_widgets(model_type):
+        field_bindings = _build_field_bindings(model_type)
+        if not field_bindings:
+            return model_type.model_validate({})
+        if not params_spec.required and _all_execute_values_empty(raw_values):
+            return None
+        # 入力の型(model_type)と、型と入力フィールドの紐づけ(field_bindings)をもとに、フィールドの値(raw_values)をPydanticモデルに変換する
+        # フィールドの値だけでは、型にそったデータ構造を復元できない。
+        # なので、field_bindingsでひもづけを復元し、model_typeで改めてmodel_validate()する
+        return _parse_action_fields(model_type, field_bindings, raw_values)
+
+    # ---入力のすべてがウィジェットで表現できない場合は、JSONテキスト1本で入力する
+    params_json = str(raw_values[0]) if raw_values else ""
+    if not params_json.strip() and not params_spec.required:
+        return None
+    return _parse_action_json(model_type, params_json)
+
+
+def _all_execute_values_empty(raw_values: tuple[Any, ...]) -> bool:
+    """すべての execute 入力が未入力相当かどうかを返す。"""
+    return all(value in (None, "") for value in raw_values)
 
 
 # -----------------------------------------------------------------------------

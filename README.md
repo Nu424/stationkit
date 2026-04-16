@@ -32,7 +32,8 @@ uv sync --group dev
 1. **`StationControllerBase` を継承**する。
 2. **`_do_connect` / `_do_disconnect` / `_do_change` / `_do_execute` / `_do_status`** を **すべて async** で実装する。
 3. **`_do_change` の第2引数 `target` に具体型のヒントを付ける**（例: `int`）。HTTP/CLI の「切替引数」の型はここから自動解決されます。`Any` のままだと警告のうえ `str` 扱いになります。
-4. 必要なら **`get_custom_actions()`** で `CustomAction` のリストを返し、固有操作を HTTP/CLI に載せる。
+4. **`_do_execute` は無引数でも実装できる**。実行ごとの設定が必要なら、`_do_execute(self, params: ExecuteParams)` または `_do_execute(self, params: ExecuteParams | None = None)` のように **Pydantic モデル 1 個**を追加できる。
+5. 必要なら **`get_custom_actions()`** で `CustomAction` のリストを返し、固有操作を HTTP/CLI に載せる。
 
 同期メソッド（`connect` など）と `*_async` は基底クラスが提供するため、装置側で二重実装する必要はありません。
 
@@ -114,13 +115,47 @@ class MyController(StationControllerBase):
 - **HTTP**: `POST /actions/ping`、ボディは `{}` のような JSON（スキーマに従う）。
 - **CLI**: `ping '{}'` のように **1 引数で JSON 文字列**を渡す（スキーマにフィールドが無い場合は空オブジェクトでよい）。
 
+## execute にパラメータを持たせる
+
+`execute()` 自体に実行時パラメータを持たせたい場合は、`_do_execute` に **Pydantic モデル 1 個**を追加します。これを定義すると、HTTP / CLI / GUI / 直接 API が同じスキーマを共有します。
+
+```python
+from typing import Any
+
+from pydantic import BaseModel
+
+from stationkit import StationControllerBase
+
+
+class ExecuteParams(BaseModel):
+    duration_s: int
+    rpm: int | None = None
+
+
+class MyDeviceController(StationControllerBase):
+    # ... _do_connect / _do_disconnect / _do_change / _do_status は省略 ...
+
+    async def _do_execute(self, params: ExecuteParams) -> dict[str, Any]:
+        return {
+            "duration_s": params.duration_s,
+            "rpm": params.rpm,
+        }
+```
+
+- **直接 API**: `controller.execute(ExecuteParams(duration_s=5, rpm=120))` または `controller.execute({"duration_s": 5, "rpm": 120})`
+- **HTTP**: `POST /execute` に `{"duration_s": 5, "rpm": 120}` を送る
+- **CLI**: `execute '{"duration_s": 5, "rpm": 120}'`
+- **GUI**: モデルの各フィールドが単純型ならフォーム入力、複雑型なら JSON 入力になる
+
+`_do_execute(self, params: ExecuteParams | None = None)` のように `None` を許可した場合は、空入力の `execute()` もそのまま使えます。
+
 ## スクリプトから直接使う（HTTP を立てない）
 
 ライブラリとして取り込み、**同じコントローラインスタンス**に対して同期 API または `async` API を呼び出します。バッチ処理や、既存の測定スクリプトから装置を叩く用途向けです。
 
 ### 同期で一通り使う例
 
-通常のスクリプト（トップレベルが同期）では、次のように書けます。`connect` → `change`（必要なら繰り返し）→ `execute` → `disconnect` の流れが典型です。
+通常のスクリプト（トップレベルが同期）では、次のように書けます。`connect` → `change`（必要なら繰り返し）→ `execute` → `disconnect` の流れが典型です。`_do_execute` に入力モデルを持たせた実装では、`execute(params)` の形で実行時パラメータも渡せます。
 
 ```python
 from stationkit import MyDeviceController
@@ -199,7 +234,7 @@ uv run uvicorn mymodule:app --reload
 | POST | `/disconnect` | 装置から切断し、未接続状態に戻す | なし（空ボディ） | `{"ok": true}` |
 | GET | `/status` | コントローラの状態名と、装置固有のステータスをまとめて取得する | なし | `{"controller_state": "CONNECTED", ...}` …`...` は `_do_status()` が返すキー（例: `current_target`） |
 | POST | `/change` | 対象ステーションやチャネルなどを切り替える（**接続済みであること**） | `{"target": <値>}` …`<値>` の型は各コントローラの `_do_change(self, target: ...)` の型ヒントに従う（例: 整数なら `{"target": 2}`） | `{"ok": true}` |
-| POST | `/execute` | メイン操作（サンプリングや計測開始など）を実行し、結果を返す（**接続済みであること**） | なし（空ボディ） | **装置の戻り値依存**。`dict` ならそのキー構造の JSON。Pydantic モデルを返す実装はプレーンなオブジェクトに変換される。例: `{"address": "COM3", "target": 2}` やモックなら `{"mock": true, "target": 2}` |
+| POST | `/execute` | メイン操作（サンプリングや計測開始など）を実行し、結果を返す（**接続済みであること**） | デフォルトは なし（空ボディ）。`_do_execute(self, params: ExecuteParams)` を定義した実装では、その **Pydantic モデルどおりの JSON**。`ExecuteParams | None = None` の場合は空ボディも可。 | **装置の戻り値依存**。`dict` ならそのキー構造の JSON。Pydantic モデルを返す実装はプレーンなオブジェクトに変換される。例: `{"address": "COM3", "target": 2}` やモックなら `{"mock": true, "target": 2}` |
 | POST | `/actions/{name}` | `get_custom_actions()` で登録した**固有操作**を実行する | **`{name}` に対応する `input_schema` どおりの JSON** 例: `calibrate` が `level` と `force` を持つなら `{"level": 7, "force": true}` | **`output_schema` がある場合**はそのフィールド構造の JSON。ない場合は操作の戻り値に応じた JSON（プレーン化ルールは `/execute` と同様） |
 
 **エラー時**（状態不整合や `StationError` 系）は HTTP ステータスが 4xx/5xx になり、本文は次の形です。
@@ -235,11 +270,14 @@ uv run python mycli.py serve --host 127.0.0.1 --port 8000
 uv run python mycli.py --server http://127.0.0.1:8000 connect COM3
 uv run python mycli.py --server http://127.0.0.1:8000 change 2
 uv run python mycli.py --server http://127.0.0.1:8000 execute
+uv run python mycli.py --server http://127.0.0.1:8000 execute '{"duration_s": 5, "rpm": 120}'
 uv run python mycli.py --server http://127.0.0.1:8000 status
 uv run python mycli.py --server http://127.0.0.1:8000 disconnect
 ```
 
 `--server` の代わりに環境変数 `STATIONKIT_SERVER_URL` でも service URL を渡せます。
+
+`execute` が入力モデルを持つコントローラでは、CLI でも **JSON 文字列 1 引数**で同じスキーマを渡します。`_do_execute(self, params: ExecuteParams | None = None)` のようなオプショナル入力なら、引数なし `execute` も引き続き使えます。
 
 ### 同一プロセスのローカル CLI を使う場合
 
@@ -278,10 +316,27 @@ app.launch()
 初版の入力方針は次のとおりです。
 
 - `change()` の `target` が `str` / `int` / `float` / `bool` の場合は、対応する GUI 入力ウィジェットが自動で使われます。
+- `execute()` も同様で、`_do_execute` の入力モデルが単純なフィールド群なら個別フォーム、複雑なスキーマなら JSON テキスト入力になります。
 - `Enum`、`list` / `dict`、`Union`、`BaseModel` などの複雑な型は、**JSON テキスト入力**にフォールバックします。
 - `CustomAction` も同様で、入力スキーマが単純なフィールド群なら個別フォーム、複雑なスキーマなら JSON テキスト入力で実行できます。
 
 GUI からの操作は共有 controller に対して逐次実行され、各操作のあとに最新の `status()` 相当の情報が画面へ再反映されます。
+
+## ロギング
+
+`stationkit` は Python 標準の `logging` を使い、コア層と各アダプタ層で同じ `extra` キーを付与します。既定では `NullHandler` が付いているため、利用側がハンドラを設定しない限り出力は増えません。
+
+```python
+import logging
+
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("stationkit").setLevel(logging.INFO)
+```
+
+主な `extra` は `stationkit_layer`, `stationkit_op`, `stationkit_controller`, `stationkit_event`, `stationkit_duration_ms`, `stationkit_success` です。`create_http_app(controller, logger=...)` を使うと、HTTP 境界ログを任意の logger に流せます。
+
+ログには操作名や状態遷移のような**運用上必要な最小情報**のみを載せ、接続先アドレス・認証情報・装置固有の秘密値などは載せない前提で使ってください。
 
 ## テスト
 

@@ -1,6 +1,8 @@
 """FastAPI アプリケーションを組み立てるファクトリ。"""
 
+import logging
 from collections.abc import Awaitable, Callable
+from time import perf_counter
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -8,6 +10,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, create_model
 
 from stationkit.adapters._shared import normalize_result, resolve_target_type
+from stationkit._logging import (
+    get_adapter_logger,
+    log_operation_failure,
+    log_operation_start,
+    log_operation_success,
+)
 from stationkit.core import (
     CommandError,
     ConnectionError,
@@ -16,9 +24,13 @@ from stationkit.core import (
     StationError,
     TimeoutError,
 )
+from stationkit.core.introspection import ExecuteParamsSpec, resolve_execute_params_spec
 
 
-def create_http_app(controller: StationControllerBase) -> FastAPI:
+def create_http_app(
+    controller: StationControllerBase,
+    logger: logging.Logger | None = None,
+) -> FastAPI:
     """コントローラ用の FastAPI アプリを生成する。
 
     標準エンドポイント（connect / disconnect / status / change / execute）に加え、
@@ -32,6 +44,8 @@ def create_http_app(controller: StationControllerBase) -> FastAPI:
     """
     app = FastAPI(title=type(controller).__name__)
     target_type = resolve_target_type(controller)
+    execute_params_spec = resolve_execute_params_spec(controller) # executeの入力仕様をもとに、エンドポイントの形式を決定する
+    app_logger = logger or get_adapter_logger("http") # httpアダプタ用のロガーを取得する
 
     # リクエストボディ用の動的モデル（change の target 型に追従）
     ConnectRequest = create_model("ConnectRequest", address=(str, ...))
@@ -56,30 +70,58 @@ def create_http_app(controller: StationControllerBase) -> FastAPI:
     @app.post("/connect")
     async def connect(req: ConnectRequest) -> dict[str, bool]:
         """装置に接続する。"""
-        await controller.connect_async(req.address)
+        await _run_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="connect",
+            operation=lambda: controller.connect_async(req.address),
+            context={"path": "/connect"},
+        )
         return {"ok": True}
 
     @app.post("/disconnect")
     async def disconnect() -> dict[str, bool]:
         """装置から切断する。"""
-        await controller.disconnect_async()
+        await _run_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="disconnect",
+            operation=controller.disconnect_async,
+            context={"path": "/disconnect"},
+        )
         return {"ok": True}
 
     @app.get("/status")
     async def status() -> dict[str, Any]:
         """コントローラおよび装置の状態を取得する。"""
-        return await controller.status_async()
+        return await _run_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="status",
+            operation=controller.status_async,
+            context={"path": "/status"},
+        )
 
     @app.post("/change")
     async def change(req: ChangeRequest) -> dict[str, bool]:
         """対象ステーション（またはチャネル）を切り替える。"""
-        await controller.change_async(req.target)
+        await _run_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="change",
+            operation=lambda: controller.change_async(req.target),
+            context={
+                "path": "/change",
+                "target_type": type(req.target).__name__,
+            },
+        )
         return {"ok": True}
-
-    @app.post("/execute")
-    async def execute() -> Any:
-        """メイン操作を実行し、結果を返す。"""
-        return normalize_result(await controller.execute_async())
+    
+    """メイン操作を実行し、結果を返す。"""
+    app.post("/execute")(
+        
+        _build_execute_endpoint(controller, app_logger, execute_params_spec)
+    )
 
     # -------------------------------------------------------------------------
     # CustomAction から動的に POST を追加
@@ -90,7 +132,15 @@ def create_http_app(controller: StationControllerBase) -> FastAPI:
             f"/actions/{action.name}",
             description=action.description,
             response_model=action.output_schema,
-        )(_build_action_endpoint(action.func, action.input_schema, action.name))
+        )(
+            _build_action_endpoint(
+                controller=controller,
+                logger=app_logger,
+                func=action.func,
+                input_schema=action.input_schema,
+                action_name=action.name,
+            )
+        )
 
     return app
 
@@ -114,6 +164,8 @@ def _resolve_status_code(exc: StationError) -> int:
 
 
 def _build_action_endpoint(
+    controller: StationControllerBase,
+    logger: logging.Logger,
     func: Callable[[BaseModel], Awaitable[Any]],
     input_schema: type[BaseModel],
     action_name: str,
@@ -130,7 +182,125 @@ def _build_action_endpoint(
     """
     async def endpoint(params: input_schema) -> Any:
         """固有操作を実行する。"""
-        return normalize_result(await func(params))
+        return await _run_http_operation(
+            logger=logger,
+            controller=controller,
+            operation_name=action_name,
+            operation=lambda: func(params),
+            context={
+                "path": f"/actions/{action_name}",
+                "has_params": True,
+            },
+            include_result=True,
+        )
 
     endpoint.__name__ = f"{action_name}_endpoint"
     return endpoint
+
+
+def _build_execute_endpoint(
+    controller: StationControllerBase,
+    logger: logging.Logger,
+    params_spec: ExecuteParamsSpec,
+) -> Callable[..., Awaitable[Any]]:
+    """execute の入力仕様に応じた FastAPI エンドポイントを返す。
+    
+    Args:
+        controller: コントローラインスタンス。
+        logger: ロガー。
+        params_spec: execute 入力仕様。
+
+    Returns:
+        FastAPI に渡す async エンドポイント。
+    """
+    # ---入力を受け取らない場合は、入力不要として、_run_http_operation()を実行する
+    if not params_spec.accepts_params:
+        async def endpoint() -> Any:
+            return await _run_http_operation(
+                logger=logger,
+                controller=controller,
+                operation_name="execute",
+                operation=controller.execute_async,
+                context={"path": "/execute", "has_params": False},
+                include_result=True,
+            )
+
+        endpoint.__name__ = "execute_endpoint"
+        return endpoint
+
+    # ---入力を受け取る場合は、入力を受け取るasync関数を定義する
+    model_type = params_spec.model_type
+    if model_type is None:
+        raise TypeError("execute parameter spec is missing model type")
+
+    if params_spec.required: # Noneが許容されない場合
+        async def endpoint(params: model_type) -> Any:
+            return await _run_http_operation(
+                logger=logger,
+                controller=controller,
+                operation_name="execute",
+                operation=lambda: controller.execute_async(params),
+                context={"path": "/execute", "has_params": True},
+                include_result=True,
+            )
+    else: # Noneが許容される場合
+        async def endpoint(params: model_type | None = None) -> Any:
+            return await _run_http_operation(
+                logger=logger,
+                controller=controller,
+                operation_name="execute",
+                operation=lambda: controller.execute_async(params),
+                context={"path": "/execute", "has_params": params is not None},
+                include_result=True,
+            )
+
+    endpoint.__name__ = "execute_endpoint"
+    return endpoint
+
+
+async def _run_http_operation(
+    *,
+    logger: logging.Logger,
+    controller: StationControllerBase,
+    operation_name: str,
+    operation: Callable[[], Awaitable[Any]],
+    context: dict[str, Any] | None = None,
+    include_result: bool = False,
+) -> Any:
+    """HTTP 境界でログを出しつつ controller 操作を 1 回実行する。"""
+    base_context = context or {}
+    started = perf_counter()
+    # ---操作開始ログを出力する
+    log_operation_start(
+        logger,
+        layer="http",
+        operation_name=operation_name,
+        controller_name=type(controller).__name__,
+        context=base_context,
+    )
+    try:
+        # ---操作を実行する
+        result = await operation()
+    except Exception as exc:
+        # ---失敗した場合、操作失敗ログを出力する
+        log_operation_failure(
+            logger,
+            layer="http",
+            operation_name=operation_name,
+            controller_name=type(controller).__name__,
+            duration_ms=(perf_counter() - started) * 1000,
+            context=base_context,
+            exc=exc,
+        )
+        raise
+
+    # ---成功した場合、操作成功ログを出力する
+    log_operation_success(
+        logger,
+        layer="http",
+        operation_name=operation_name,
+        controller_name=type(controller).__name__,
+        duration_ms=(perf_counter() - started) * 1000,
+        context=base_context,
+    )
+    return normalize_result(result) if include_result else result

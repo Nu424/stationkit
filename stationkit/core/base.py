@@ -7,11 +7,20 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from time import perf_counter
 from abc import ABC, abstractmethod
 from typing import Any
 
+from stationkit._logging import (
+    get_controller_logger,
+    log_operation_failure,
+    log_operation_start,
+    log_operation_success,
+)
 from stationkit.core.action import CustomAction
 from stationkit.core.exceptions import StateError
+from stationkit.core.introspection import normalize_execute_params
 from stationkit.core.state import ControllerState
 
 
@@ -29,6 +38,7 @@ class StationControllerBase(ABC):
     def __init__(self) -> None:
         """コントローラを ``DISCONNECTED`` で初期化する。"""
         self._state = ControllerState.DISCONNECTED
+        self._logger = get_controller_logger(type(self).__name__)
 
     @property
     def state(self) -> ControllerState:
@@ -68,6 +78,11 @@ class StationControllerBase(ABC):
     async def _do_execute(self) -> Any:
         """メイン操作（サンプリング等）を実行する（実装者用）。
 
+        サブクラスは後方互換のため無引数のまま実装してよい。必要なら
+        ``_do_execute(self, params: MyParams)`` または
+        ``_do_execute(self, params: MyParams | None = None)`` のように
+        Pydantic モデル 1 個を追加で受け取れる。
+
         Returns:
             装置から得た結果。dict や Pydantic モデルなど任意。
         """
@@ -93,12 +108,19 @@ class StationControllerBase(ABC):
         Raises:
             StateError: 既に ``DISCONNECTED`` でない場合。
         """
-        if self._state != ControllerState.DISCONNECTED:
-            raise StateError(
-                f"connect requires DISCONNECTED state, current: {self._state.name}"
-            )
-        await self._do_connect(address)
-        self._state = ControllerState.CONNECTED
+        async def operation() -> None:
+            if self._state != ControllerState.DISCONNECTED:
+                raise StateError(
+                    f"connect requires DISCONNECTED state, current: {self._state.name}"
+                )
+            await self._do_connect(address)
+            self._state = ControllerState.CONNECTED
+
+        await self._run_logged_operation(
+            "connect",
+            operation,
+            log_context={"address_provided": bool(address)},
+        )
 
     async def disconnect_async(self) -> None:
         """非同期で装置から切断する。
@@ -106,10 +128,13 @@ class StationControllerBase(ABC):
         Raises:
             StateError: すでに ``DISCONNECTED`` の場合。
         """
-        if self._state == ControllerState.DISCONNECTED:
-            raise StateError("Already disconnected")
-        await self._do_disconnect()
-        self._state = ControllerState.DISCONNECTED
+        async def operation() -> None:
+            if self._state == ControllerState.DISCONNECTED:
+                raise StateError("Already disconnected")
+            await self._do_disconnect()
+            self._state = ControllerState.DISCONNECTED
+
+        await self._run_logged_operation("disconnect", operation)
 
     async def change_async(self, target: Any) -> None:
         """非同期で対象を切り替える。
@@ -120,14 +145,26 @@ class StationControllerBase(ABC):
         Raises:
             StateError: 未接続など、接続済みでない場合。
         """
-        self._require_connected()
-        await self._do_change(target)
+        async def operation() -> None:
+            self._require_connected()
+            await self._do_change(target)
 
-    async def execute_async(self) -> Any:
+        await self._run_logged_operation(
+            "change",
+            operation,
+            log_context={"target_type": type(target).__name__},
+        )
+
+    async def execute_async(self, params: Any | None = None) -> Any:
         """非同期でメイン操作を実行する。
 
         実行中は状態が ``BUSY`` になり、成功時は ``CONNECTED`` に戻る。
         例外発生時は ``ERROR`` になる。
+
+        Args:
+            params: execute 入力。Pydantic モデルインスタンス、または
+                ``dict`` などモデルに変換できる値を渡す。``_do_execute`` が
+                引数を持たない場合は ``None`` を渡すか省略する。
 
         Returns:
             ``_do_execute`` の戻り値。
@@ -136,15 +173,29 @@ class StationControllerBase(ABC):
             StateError: 未接続の場合。
             Exception: ``_do_execute`` 内で発生した例外（状態は ``ERROR``）。
         """
-        self._require_connected()
-        self._state = ControllerState.BUSY
-        try:
-            result = await self._do_execute()
-        except Exception:
-            self._state = ControllerState.ERROR
-            raise
-        self._state = ControllerState.CONNECTED
-        return result
+        # ---引数として渡されたパラメータを、Pydanticモデルに変換する
+        normalized_params = normalize_execute_params(self, params)
+
+        async def operation() -> Any:
+            self._require_connected()
+            self._state = ControllerState.BUSY
+            try:
+                # ---引数をつけたりつけなかったりしながら、_do_execute()を実行する
+                if normalized_params is None:
+                    result = await self._do_execute()
+                else:
+                    result = await self._do_execute(normalized_params)
+            except Exception:
+                self._state = ControllerState.ERROR
+                raise
+            self._state = ControllerState.CONNECTED
+            return result
+
+        return await self._run_logged_operation(
+            "execute",
+            operation,
+            log_context={"has_params": normalized_params is not None},
+        )
 
     async def status_async(self) -> dict[str, Any]:
         """非同期で状態を取得する。
@@ -152,10 +203,13 @@ class StationControllerBase(ABC):
         Returns:
             ``controller_state`` キーと ``_do_status`` の結果をマージした dict。
         """
-        return {
-            "controller_state": self._state.name,
-            **(await self._do_status()),
-        }
+        async def operation() -> dict[str, Any]:
+            return {
+                "controller_state": self._state.name,
+                **(await self._do_status()),
+            }
+
+        return await self._run_logged_operation("status", operation)
 
     # -------------------------------------------------------------------------
     # 公開 API（同期ラッパー）
@@ -191,8 +245,11 @@ class StationControllerBase(ABC):
         """
         self._run_sync(self.change_async(target))
 
-    def execute(self) -> Any:
+    def execute(self, params: Any | None = None) -> Any:
         """同期でメイン操作を実行する。
+
+        Args:
+            params: ``execute_async`` と同じ execute 入力。
 
         Returns:
             ``_do_execute`` の戻り値。
@@ -200,7 +257,7 @@ class StationControllerBase(ABC):
         Raises:
             RuntimeError: イベントループ内から呼ばれた場合。
         """
-        return self._run_sync(self.execute_async())
+        return self._run_sync(self.execute_async(params))
 
     def status(self) -> dict[str, Any]:
         """同期で状態を取得する。
@@ -241,6 +298,62 @@ class StationControllerBase(ABC):
             raise StateError(
                 f"Operation requires CONNECTED state, current: {self._state.name}"
             )
+
+    async def _run_logged_operation(
+        self,
+        operation_name: str,
+        operation: Callable[[], Awaitable[Any]],
+        log_context: dict[str, Any] | None = None,
+    ) -> Any:
+        """操作の開始・終了・失敗ログを共通化する。
+        
+        Args:
+            operation_name: 操作名。
+            operation: 操作関数。
+            log_context: ログコンテキスト。
+
+        Returns:
+            操作の結果。
+
+        Raises:
+            Exception: 操作中に発生した例外。
+        """
+        context = {"state_before": self._state.name, **(log_context or {})}
+        started = perf_counter()
+        # ---操作開始ログを出力する
+        log_operation_start(
+            self._logger,
+            layer="controller",
+            operation_name=operation_name,
+            controller_name=type(self).__name__,
+            context=context,
+        )
+        try:
+            # ---操作を実行する
+            result = await operation()
+        except Exception as exc:
+            # ---失敗した場合、操作失敗ログを出力する
+            log_operation_failure(
+                self._logger,
+                layer="controller",
+                operation_name=operation_name,
+                controller_name=type(self).__name__,
+                duration_ms=(perf_counter() - started) * 1000,
+                context={**context, "state_after": self._state.name},
+                exc=exc,
+            )
+            raise
+
+        # ---成功した場合、操作成功ログを出力する
+        log_operation_success(
+            self._logger,
+            layer="controller",
+            operation_name=operation_name,
+            controller_name=type(self).__name__,
+            duration_ms=(perf_counter() - started) * 1000,
+            context={**context, "state_after": self._state.name},
+        )
+        return result
 
     @staticmethod
     def _run_sync(coro: Any) -> Any:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from threading import Lock
 from typing import Any
 
@@ -22,6 +23,7 @@ from stationkit import (
     create_http_app,
     create_local_cli_app,
 )
+from stationkit.core.introspection import resolve_execute_params_spec
 from stationkit.testing import MockStationController
 
 # -----------------------------------------------------------------------------
@@ -56,6 +58,20 @@ class ComplexActionInput(BaseModel):
     config: dict[str, int]
 
 
+class ExecuteInput(BaseModel):
+    """execute 用の必須入力スキーマ。"""
+
+    duration_s: int
+    rpm: int | None = None
+
+
+class OptionalExecuteInput(BaseModel):
+    """execute 用のオプショナル入力スキーマ。"""
+
+    duration_s: int | None = None
+    rpm: int | None = None
+
+
 class AdvancedMockStationController(MockStationController):
     """固有操作 calibrate を公開するモック。"""
 
@@ -81,6 +97,34 @@ class AdvancedMockStationController(MockStationController):
                 output_schema=CalibrateOutput,
             )
         ]
+
+
+class ParameterizedExecuteController(MockStationController):
+    """execute が必須パラメータを受け取るモック。"""
+
+    async def _do_execute(self, params: ExecuteInput) -> dict[str, Any]:
+        self._call_log.append(f"execute({params.duration_s}, {params.rpm})")
+        return {
+            "mock": True,
+            "target": self._current_target,
+            "params": params.model_dump(),
+        }
+
+
+class OptionalExecuteController(MockStationController):
+    """execute がオプショナルパラメータを受け取るモック。"""
+
+    async def _do_execute(
+        self,
+        params: OptionalExecuteInput | None = None,
+    ) -> dict[str, Any]:
+        payload = None if params is None else params.model_dump()
+        self._call_log.append(f"execute({payload})")
+        return {
+            "mock": True,
+            "target": self._current_target,
+            "params": payload,
+        }
 
 
 # -----------------------------------------------------------------------------
@@ -119,6 +163,34 @@ def test_execute_failure_sets_error_state() -> None:
         controller.execute()
 
     assert controller.state == ControllerState.ERROR
+
+
+def test_execute_supports_required_and_optional_params() -> None:
+    """execute が必須/任意パラメータ付きで呼べること。"""
+    required = ParameterizedExecuteController()
+    required.connect("COM3")
+    required.change(2)
+
+    with pytest.raises(TypeError, match="requires execute parameters"):
+        required.execute()
+
+    result = required.execute({"duration_s": 5, "rpm": 120})
+    assert result == {
+        "mock": True,
+        "target": 2,
+        "params": {"duration_s": 5, "rpm": 120},
+    }
+
+    optional = OptionalExecuteController()
+    optional.connect("COM4")
+    optional.change(7)
+
+    assert optional.execute() == {"mock": True, "target": 7, "params": None}
+    assert optional.execute({"duration_s": 3}) == {
+        "mock": True,
+        "target": 7,
+        "params": {"duration_s": 3, "rpm": None},
+    }
 
 
 def test_sync_api_rejects_active_event_loop() -> None:
@@ -160,6 +232,42 @@ def test_http_adapter_exposes_core_and_custom_actions() -> None:
     assert status.json()["controller_state"] == "CONNECTED"
 
 
+def test_http_adapter_supports_required_and_optional_execute_params() -> None:
+    """HTTP execute が required / optional body を扱えること。"""
+    required_controller = ParameterizedExecuteController()
+    required_client = TestClient(create_http_app(required_controller))
+    required_client.post("/connect", json={"address": "COM9"})
+    required_client.post("/change", json={"target": 2})
+
+    missing = required_client.post("/execute")
+    provided = required_client.post("/execute", json={"duration_s": 6, "rpm": 90})
+
+    assert missing.status_code == 422
+    assert provided.status_code == 200
+    assert provided.json() == {
+        "mock": True,
+        "target": 2,
+        "params": {"duration_s": 6, "rpm": 90},
+    }
+
+    optional_controller = OptionalExecuteController()
+    optional_client = TestClient(create_http_app(optional_controller))
+    optional_client.post("/connect", json={"address": "COM10"})
+    optional_client.post("/change", json={"target": 4})
+
+    empty = optional_client.post("/execute")
+    payload = optional_client.post("/execute", json={"duration_s": 9})
+
+    assert empty.status_code == 200
+    assert empty.json() == {"mock": True, "target": 4, "params": None}
+    assert payload.status_code == 200
+    assert payload.json() == {
+        "mock": True,
+        "target": 4,
+        "params": {"duration_s": 9, "rpm": None},
+    }
+
+
 def test_gui_adapter_builds_blocks() -> None:
     """GUI アダプタが Gradio Blocks を返せること。"""
     app = create_gui_app(AdvancedMockStationController())
@@ -174,7 +282,11 @@ def test_gui_handlers_share_controller_state_and_refresh_status() -> None:
 
     connect = gui_adapter._build_connect_handler(controller, operation_lock)
     change = gui_adapter._build_change_handler(controller, operation_lock, int)
-    execute = gui_adapter._build_execute_handler(controller, operation_lock)
+    execute = gui_adapter._build_execute_handler(
+        controller,
+        operation_lock,
+        resolve_execute_params_spec(controller),
+    )
 
     connect_message, connect_result, connect_status = asyncio.run(connect("COM7"))
     change_message, change_result, change_status = asyncio.run(change(3))
@@ -196,6 +308,41 @@ def test_gui_handlers_share_controller_state_and_refresh_status() -> None:
         "change(3)",
         "execute()",
     ]
+
+
+def test_gui_execute_handler_supports_required_and_optional_params() -> None:
+    """GUI execute helper が params あり/なしを扱えること。"""
+    required = ParameterizedExecuteController()
+    required.connect("COM8")
+    required.change(5)
+    required_execute = gui_adapter._build_execute_handler(
+        required,
+        Lock(),
+        resolve_execute_params_spec(required),
+    )
+
+    message, result, status = asyncio.run(required_execute(4.0, 150.0))
+    assert message == "Execution completed."
+    assert result == {
+        "mock": True,
+        "target": 5,
+        "params": {"duration_s": 4, "rpm": 150},
+    }
+    assert status["controller_state"] == "CONNECTED"
+
+    optional = OptionalExecuteController()
+    optional.connect("COM11")
+    optional.change(8)
+    optional_execute = gui_adapter._build_execute_handler(
+        optional,
+        Lock(),
+        resolve_execute_params_spec(optional),
+    )
+
+    message, result, status = asyncio.run(optional_execute(None, None))
+    assert message == "Execution completed."
+    assert result == {"mock": True, "target": 8, "params": None}
+    assert status["controller_state"] == "CONNECTED"
 
 
 def test_gui_value_coercion_supports_scalar_and_json_fallback() -> None:
@@ -245,6 +392,33 @@ def test_local_cli_adapter_supports_core_and_custom_commands() -> None:
     assert execute.stdout == '{"mock": true, "target": 6}\n'
     assert action.exit_code == 0
     assert action.stdout == '{"status": "success", "level": 5}\n'
+
+
+def test_local_cli_execute_supports_required_and_optional_params() -> None:
+    """ローカル CLI の execute が required / optional params を扱えること。"""
+    required_app = create_local_cli_app(ParameterizedExecuteController())
+    runner = CliRunner()
+
+    assert runner.invoke(required_app, ["connect", "COM4"]).exit_code == 0
+    assert runner.invoke(required_app, ["change", "6"]).exit_code == 0
+    required_execute = runner.invoke(
+        required_app,
+        ["execute", '{"duration_s": 5, "rpm": 140}'],
+    )
+
+    assert required_execute.exit_code == 0
+    assert (
+        required_execute.stdout
+        == '{"mock": true, "target": 6, "params": {"duration_s": 5, "rpm": 140}}\n'
+    )
+
+    optional_app = create_local_cli_app(OptionalExecuteController())
+    assert runner.invoke(optional_app, ["connect", "COM5"]).exit_code == 0
+    assert runner.invoke(optional_app, ["change", "2"]).exit_code == 0
+    optional_execute = runner.invoke(optional_app, ["execute"])
+
+    assert optional_execute.exit_code == 0
+    assert optional_execute.stdout == '{"mock": true, "target": 2, "params": null}\n'
 
 
 def test_cli_adapter_supports_service_backed_commands(
@@ -333,6 +507,77 @@ def test_cli_adapter_supports_service_backed_commands(
         ),
         ("GET", "http://svc.test", "/status", None),
     ]
+
+
+def test_cli_execute_supports_required_and_optional_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """service-backed CLI の execute が required / optional payload を送れること。"""
+    calls: list[tuple[str, str, str, Any | None]] = []
+
+    def fake_request(
+        method: str,
+        server_url: str,
+        path: str,
+        payload: Any | None = None,
+    ) -> Any:
+        calls.append((method, server_url, path, payload))
+        if path == "/execute":
+            return {"payload": payload}
+        if path == "/connect":
+            return {"ok": True}
+        if path == "/change":
+            return {"ok": True}
+        raise AssertionError(f"Unexpected service path: {path}")
+
+    monkeypatch.setattr(cli_adapter, "_request_service", fake_request)
+    runner = CliRunner()
+
+    required_app = create_cli_app(ParameterizedExecuteController())
+    runner.invoke(required_app, ["--server", "http://svc.test", "connect", "COM4"])
+    runner.invoke(required_app, ["--server", "http://svc.test", "change", "6"])
+    required_execute = runner.invoke(
+        required_app,
+        ["--server", "http://svc.test", "execute", '{"duration_s": 5, "rpm": 80}'],
+    )
+
+    assert required_execute.exit_code == 0
+    assert required_execute.stdout == '{"payload": {"duration_s": 5, "rpm": 80}}\n'
+
+    optional_app = create_cli_app(OptionalExecuteController())
+    runner.invoke(optional_app, ["--server", "http://svc.test", "connect", "COM7"])
+    runner.invoke(optional_app, ["--server", "http://svc.test", "change", "9"])
+    optional_execute = runner.invoke(
+        optional_app,
+        ["--server", "http://svc.test", "execute"],
+    )
+
+    assert optional_execute.exit_code == 0
+    assert optional_execute.stdout == '{"payload": null}\n'
+    assert ("POST", "http://svc.test", "/execute", {"duration_s": 5, "rpm": 80}) in calls
+    assert ("POST", "http://svc.test", "/execute", None) in calls
+
+
+def test_stationkit_logging_emits_core_and_http_records(caplog: pytest.LogCaptureFixture) -> None:
+    """controller と HTTP 境界が共通 extra フィールドでログを出すこと。"""
+    caplog.set_level(logging.INFO, logger="stationkit")
+    controller = ParameterizedExecuteController()
+    app_logger = logging.getLogger("stationkit.http.test")
+    client = TestClient(create_http_app(controller, logger=app_logger))
+
+    client.post("/connect", json={"address": "COM12"})
+    client.post("/change", json={"target": 3})
+    execute = client.post("/execute", json={"duration_s": 4, "rpm": 70})
+
+    assert execute.status_code == 200
+    execute_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "stationkit_op", None) == "execute"
+        and getattr(record, "stationkit_event", None) == "success"
+    ]
+    assert any(record.stationkit_layer == "controller" for record in execute_records)
+    assert any(record.stationkit_layer == "http" for record in execute_records)
 
 
 def test_cli_adapter_supports_serve_command(

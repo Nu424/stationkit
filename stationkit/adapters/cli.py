@@ -3,17 +3,26 @@
 import json
 from collections.abc import Callable
 from importlib import import_module
+from time import perf_counter
 from typing import Any
 
 import httpx
 import typer
 from pydantic import BaseModel, ValidationError
 
+from stationkit._logging import (
+    get_adapter_logger,
+    log_operation_failure,
+    log_operation_start,
+    log_operation_success,
+)
 from stationkit.adapters._shared import format_cli_output, normalize_result, resolve_target_type
 from stationkit.adapters.http import create_http_app
 from stationkit.core import StationControllerBase
+from stationkit.core.introspection import ExecuteParamsSpec, resolve_execute_params_spec
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
+LOGGER = get_adapter_logger("cli")
 
 
 class ServiceClientError(Exception):
@@ -34,6 +43,7 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
     """
     app = typer.Typer(name=type(controller).__name__)
     target_type = resolve_target_type(controller)
+    execute_params_spec = resolve_execute_params_spec(controller)
 
     @app.callback()
     def callback(
@@ -83,7 +93,10 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
                 _get_server_url(ctx),
                 "/connect",
                 {"address": address},
-            )
+            ),
+            operation_name="connect",
+            controller_name=type(controller).__name__,
+            log_context={"path": "/connect", "address_provided": bool(address)},
         )
         typer.echo("Connected.")
 
@@ -91,7 +104,10 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
     def disconnect(ctx: typer.Context) -> None:
         """装置から切断する。"""
         _handle_service_call(
-            lambda: _request_service("POST", _get_server_url(ctx), "/disconnect")
+            lambda: _request_service("POST", _get_server_url(ctx), "/disconnect"),
+            operation_name="disconnect",
+            controller_name=type(controller).__name__,
+            log_context={"path": "/disconnect"},
         )
         typer.echo("Disconnected.")
 
@@ -99,7 +115,10 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
     def status(ctx: typer.Context) -> None:
         """状態を表示する。"""
         result = _handle_service_call(
-            lambda: _request_service("GET", _get_server_url(ctx), "/status")
+            lambda: _request_service("GET", _get_server_url(ctx), "/status"),
+            operation_name="status",
+            controller_name=type(controller).__name__,
+            log_context={"path": "/status"},
         )
         typer.echo(format_cli_output(result))
 
@@ -112,17 +131,22 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
                 _get_server_url(ctx),
                 "/change",
                 {"target": target},
-            )
+            ),
+            operation_name="change",
+            controller_name=type(controller).__name__,
+            log_context={
+                "path": "/change",
+                "target_type": type(target).__name__,
+            },
         )
         typer.echo(f"Changed to {target}.")
 
-    @app.command()
-    def execute(ctx: typer.Context) -> None:
-        """メイン操作を実行し、結果を表示する。"""
-        result = _handle_service_call(
-            lambda: _request_service("POST", _get_server_url(ctx), "/execute")
+    app.command(name="execute")(
+        _build_execute_command(
+            params_spec=execute_params_spec,
+            controller_name=type(controller).__name__,
         )
-        typer.echo(format_cli_output(result))
+    )
 
     # -------------------------------------------------------------------------
     # CustomAction から動的にサブコマンドを追加
@@ -131,6 +155,7 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
     for action in controller.get_custom_actions():
         app.command(name=action.name)(
             _build_action_command(
+                controller_name=type(controller).__name__,
                 input_schema=action.input_schema,
                 action_name=action.name,
                 description=action.description,
@@ -141,6 +166,7 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
 
 
 def _build_action_command(
+    controller_name: str,
     input_schema: type[BaseModel],
     action_name: str,
     description: str,
@@ -163,7 +189,10 @@ def _build_action_command(
                 _get_server_url(ctx),
                 f"/actions/{action_name}",
                 input_schema.model_validate_json(params_json).model_dump(),
-            )
+            ),
+            operation_name=action_name,
+            controller_name=controller_name,
+            log_context={"path": f"/actions/{action_name}", "has_params": True},
         )
         typer.echo(format_cli_output(result))
 
@@ -177,16 +206,58 @@ def _get_server_url(ctx: typer.Context) -> str:
     return str(ctx.obj["server_url"])
 
 
-def _handle_service_call(func: Callable[[], Any]) -> Any:
+def _handle_service_call(
+    func: Callable[[], Any],
+    *,
+    operation_name: str,
+    controller_name: str,
+    log_context: dict[str, Any] | None = None,
+) -> Any:
     """通信・入力検証エラーを CLI 向けに整形する。"""
+    started = perf_counter()
+    context = log_context or {}
+    log_operation_start(
+        LOGGER,
+        layer="cli",
+        operation_name=operation_name,
+        controller_name=controller_name,
+        context=context,
+    )
     try:
-        return func()
+        result = func()
     except ValidationError as exc:
+        log_operation_failure(
+            LOGGER,
+            layer="cli",
+            operation_name=operation_name,
+            controller_name=controller_name,
+            duration_ms=(perf_counter() - started) * 1000,
+            context=context,
+            exc=exc,
+        )
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
     except ServiceClientError as exc:
+        log_operation_failure(
+            LOGGER,
+            layer="cli",
+            operation_name=operation_name,
+            controller_name=controller_name,
+            duration_ms=(perf_counter() - started) * 1000,
+            context=context,
+            exc=exc,
+        )
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
+    log_operation_success(
+        LOGGER,
+        layer="cli",
+        operation_name=operation_name,
+        controller_name=controller_name,
+        duration_ms=(perf_counter() - started) * 1000,
+        context=context,
+    )
+    return result
 
 
 def _normalize_server_url(server_url: str) -> str:
@@ -248,3 +319,91 @@ def _format_error_response(response: httpx.Response) -> str:
     if isinstance(parsed, dict) and "detail" in parsed:
         return str(parsed["detail"])
     return response.text
+
+
+def _build_execute_command(
+    params_spec: ExecuteParamsSpec,
+    controller_name: str,
+) -> Callable[..., None]:
+    """execute 用 CLI コマンドを入力仕様に応じて生成する。"""
+    # ---executeが、パラメータ不要の場合
+    if not params_spec.accepts_params:
+        def command(ctx: typer.Context) -> None:
+            """メイン操作を実行し、結果を表示する。"""
+            result = _handle_service_call(
+                lambda: _request_service("POST", _get_server_url(ctx), "/execute"),
+                operation_name="execute",
+                controller_name=controller_name,
+                log_context={"path": "/execute", "has_params": False},
+            )
+            typer.echo(format_cli_output(result))
+
+        command.__name__ = "execute_command"
+        return command
+
+    # ---executeが、パラメータ必須の場合
+    if params_spec.required:
+        def command(ctx: typer.Context, params_json: str) -> None:
+            """メイン操作を実行し、結果を表示する。"""
+            result = _handle_service_call(
+                lambda: _request_service(
+                    "POST",
+                    _get_server_url(ctx),
+                    "/execute",
+                    _parse_execute_payload(params_spec, params_json),
+                ),
+                operation_name="execute",
+                controller_name=controller_name,
+                log_context={"path": "/execute", "has_params": True},
+            )
+            typer.echo(format_cli_output(result))
+    else: # ---executeが、パラメータ任意の場合
+        def command(ctx: typer.Context, params_json: str = "") -> None:
+            """メイン操作を実行し、結果を表示する。"""
+            result = _handle_service_call(
+                lambda: _request_service(
+                    "POST",
+                    _get_server_url(ctx),
+                    "/execute",
+                    _parse_execute_payload(params_spec, params_json),
+                ),
+                operation_name="execute",
+                controller_name=controller_name,
+                log_context={
+                    "path": "/execute",
+                    "has_params": bool(params_json.strip()), # ここが違うだけ？
+                },
+            )
+            typer.echo(format_cli_output(result))
+
+    command.__name__ = "execute_command"
+    return command
+
+
+def _parse_execute_payload(
+    params_spec: ExecuteParamsSpec,
+    params_json: str,
+) -> dict[str, Any] | None:
+    """CLI の execute 入力 JSON を検証して payload 化する。"""
+    model_type = params_spec.model_type
+    if model_type is None:
+        return None
+
+    text = params_json.strip()
+    if not text:
+        if params_spec.required:
+            raise ValidationError.from_exception_data(
+                title=model_type.__name__,
+                line_errors=[
+                    {
+                        "type": "missing",
+                        "loc": ("params",),
+                        "msg": "Field required",
+                        "input": None,
+                    }
+                ],
+            )
+        return None
+
+    # ---入力テキストをmodel_validate_json()して、Pydanticモデルに変換する
+    return model_type.model_validate_json(text).model_dump()
