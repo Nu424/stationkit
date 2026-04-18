@@ -34,8 +34,10 @@ uv sync --group dev
 3. **`_do_change` の第2引数 `target` に具体型のヒントを付ける**（例: `int`）。HTTP/CLI の「切替引数」の型はここから自動解決されます。`Any` のままだと警告のうえ `str` 扱いになります。
 4. **`_do_execute` は無引数でも実装できる**。実行ごとの設定が必要なら、`_do_execute(self, params: ExecuteParams)` または `_do_execute(self, params: ExecuteParams | None = None)` のように **Pydantic モデル 1 個**を追加できる。
 5. 必要なら **`get_custom_actions()`** で `CustomAction` のリストを返し、固有操作を HTTP/CLI に載せる。
+6. 安全な中断に対応したい装置だけ、**同期メソッド `cancel_execution()`** を任意実装する。中断後は `_do_execute()` が `ExecutionCancelledError` を送出して unwind するのを標準ルールにする。
 
 同期メソッド（`connect` など）と `*_async` は基底クラスが提供するため、装置側で二重実装する必要はありません。
+`_do_execute()` の中身は同期的に長時間かかる処理でも構いません。HTTP / GUI / service-backed CLI のように UX 上ブロッキングを避けたい面では、後述の `ExecutionManager` が `controller.execute()` 全体を別スレッドで管理します。
 
 ## 同期 API と非同期 API
 
@@ -210,6 +212,35 @@ asyncio.run(run_sequence())
 
 失敗時は `stationkit` の例外（例: 未接続で `change` したときの `StateError`）がそのまま伝播します。装置側のエラーは、可能なら `ConnectionError` / `CommandError` などにマッピングしておくと、HTTP 経由のときとメッセージの扱いが揃いやすくなります。
 
+## 長時間 execute を別層で扱う
+
+`execute()` / `execute_async()` は引き続き「完了まで待って結果を返す」API です。これを変えたくない一方で、HTTP や GUI では長時間の実行を別スレッドで扱いたいので、`stationkit` は **`ExecutionManager`** を別層で用意しています。
+
+```python
+from stationkit import ExecutionManager, ExecutionState, MyDeviceController
+
+ctrl = MyDeviceController()
+ctrl.connect("COM3")
+ctrl.change(1)
+
+manager = ExecutionManager(ctrl)
+handle = manager.start()
+
+while True:
+    status = manager.get_status(handle.execution_id)
+    print(status.state)
+    if status.state not in {ExecutionState.RUNNING, ExecutionState.CANCELLING}:
+        break
+
+if status.state == ExecutionState.SUCCEEDED:
+    print(status.result)
+```
+
+- `ExecutionManager` は **`controller.execute()` を丸ごと** single-worker thread で実行します。`_do_execute()` を直接呼びません。
+- `get_status()` は in-memory のジョブ状態だけを返し、装置 I/O を行いません。
+- `cancel()` は worker thread を kill せず、`cancel_execution()` hook を持つ controller に対して **協調的 cancel** を要求します。
+- `cancel_execution()` を実装しない controller では、`ExecutionManager.cancel()` は未対応エラーを返します。
+
 ## HTTP サーバーとして動かす
 
 ```python
@@ -235,6 +266,9 @@ uv run uvicorn mymodule:app --reload
 | GET | `/status` | コントローラの状態名と、装置固有のステータスをまとめて取得する | なし | `{"controller_state": "CONNECTED", ...}` …`...` は `_do_status()` が返すキー（例: `current_target`） |
 | POST | `/change` | 対象ステーションやチャネルなどを切り替える（**接続済みであること**） | `{"target": <値>}` …`<値>` の型は各コントローラの `_do_change(self, target: ...)` の型ヒントに従う（例: 整数なら `{"target": 2}`） | `{"ok": true}` |
 | POST | `/execute` | メイン操作（サンプリングや計測開始など）を実行し、結果を返す（**接続済みであること**） | デフォルトは なし（空ボディ）。`_do_execute(self, params: ExecuteParams)` を定義した実装では、その **Pydantic モデルどおりの JSON**。`ExecuteParams | None = None` の場合は空ボディも可。 | **装置の戻り値依存**。`dict` ならそのキー構造の JSON。Pydantic モデルを返す実装はプレーンなオブジェクトに変換される。例: `{"address": "COM3", "target": 2}` やモックなら `{"mock": true, "target": 2}` |
+| POST | `/execute/start` | `ExecutionManager` 経由で execute を開始し、すぐ制御を返す | `/execute` と同じ | `{"execution_id": "<id>"}` |
+| GET | `/execute/status` | 直近または指定 execute ジョブの状態を取得する | クエリ `execution_id=<id>` は任意 | `{"execution_id": "...", "state": "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED", "result": ..., "error_message": null, "cancel_requested": false, ...}` |
+| POST | `/execute/cancel` | 進行中 execute の cancel を要求する | `{"execution_id": "<id>"}` は任意 | `{"ok": true}` |
 | POST | `/actions/{name}` | `get_custom_actions()` で登録した**固有操作**を実行する | **`{name}` に対応する `input_schema` どおりの JSON** 例: `calibrate` が `level` と `force` を持つなら `{"level": 7, "force": true}` | **`output_schema` がある場合**はそのフィールド構造の JSON。ない場合は操作の戻り値に応じた JSON（プレーン化ルールは `/execute` と同様） |
 
 **エラー時**（状態不整合や `StationError` 系）は HTTP ステータスが 4xx/5xx になり、本文は次の形です。
@@ -269,6 +303,9 @@ uv run python mycli.py serve --host 127.0.0.1 --port 8000
 # terminal 2: CLI client から service を叩く
 uv run python mycli.py --server http://127.0.0.1:8000 connect COM3
 uv run python mycli.py --server http://127.0.0.1:8000 change 2
+uv run python mycli.py --server http://127.0.0.1:8000 execute-start
+uv run python mycli.py --server http://127.0.0.1:8000 execute-status
+uv run python mycli.py --server http://127.0.0.1:8000 execute-cancel
 uv run python mycli.py --server http://127.0.0.1:8000 execute
 uv run python mycli.py --server http://127.0.0.1:8000 execute '{"duration_s": 5, "rpm": 120}'
 uv run python mycli.py --server http://127.0.0.1:8000 status
@@ -277,7 +314,7 @@ uv run python mycli.py --server http://127.0.0.1:8000 disconnect
 
 `--server` の代わりに環境変数 `STATIONKIT_SERVER_URL` でも service URL を渡せます。
 
-`execute` が入力モデルを持つコントローラでは、CLI でも **JSON 文字列 1 引数**で同じスキーマを渡します。`_do_execute(self, params: ExecuteParams | None = None)` のようなオプショナル入力なら、引数なし `execute` も引き続き使えます。
+`execute-start` / `execute-status` / `execute-cancel` は、それぞれ execution id の発行、実行状態の確認、cancel 要求を明示的に行うためのコマンドです。`execute` は引き続き **完了まで待機する convenience command** として残してあり、内部実装では `POST /execute/start` と `GET /execute/status` の polling を使います。`execute` が入力モデルを持つコントローラでは、CLI でも **JSON 文字列 1 引数**で同じスキーマを渡します。`_do_execute(self, params: ExecuteParams | None = None)` のようなオプショナル入力なら、引数なし `execute` も引き続き使えます。
 
 ### 同一プロセスのローカル CLI を使う場合
 
@@ -319,6 +356,10 @@ app.launch()
 - `execute()` も同様で、`_do_execute` の入力モデルが単純なフィールド群なら個別フォーム、複雑なスキーマなら JSON テキスト入力になります。
 - `Enum`、`list` / `dict`、`Union`、`BaseModel` などの複雑な型は、**JSON テキスト入力**にフォールバックします。
 - `CustomAction` も同様で、入力スキーマが単純なフィールド群なら個別フォーム、複雑なスキーマなら JSON テキスト入力で実行できます。
+- GUI の `Start Execute` は内部で `ExecutionManager` を使って **非ブロッキングに開始** され、handler 自体は完了まで待機しません。
+- 実行状況や最終 result は `Refresh Status` で確認します。完了済み execution があれば Result パネルにも反映されます。
+- `Cancel Execute` で協調的 cancel を要求できます。
+- GUI の Status パネルには controller/device status に加えて、取得可能なら `execution` キーでジョブ状態も表示されます。
 
 GUI からの操作は共有 controller に対して逐次実行され、各操作のあとに最新の `status()` 相当の情報が画面へ再反映されます。
 
@@ -350,6 +391,7 @@ uv run pytest
 
 - 装置側の例外は、可能なら **`ConnectionError` / `CommandError` / `TimeoutError`** などフレームワークの型に寄せると、HTTP/CLI で扱いやすくなります。
 - **状態不整合**（未接続で `change` など）は基底クラスが **`StateError`** を送出します。
+- 安全に中断できた execute は **`ExecutionCancelledError`** を使うと、`ExecutionManager` が `CANCELLED` として扱えます。
 
 ## 今後の拡張
 

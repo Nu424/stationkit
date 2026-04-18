@@ -79,6 +79,7 @@ class StateError(StationError):
 実装者は `_do_xxx` メソッド群（async）をオーバーライドする。
 公開APIは sync 版 (`connect`, `execute`, ...) と async 版 (`connect_async`, `execute_async`, ...) の二重インターフェースで提供される。
 状態ガード等の共通処理は公開API側に集約し、具体クラスに漏れない設計とする。
+`_do_execute()` の中では同期的に長時間かかる処理を書いてよく、UX 上それを避けたい呼び出し面だけ別層の `ExecutionManager` で包む。
 
 ```python
 # stationkit/core/base.py
@@ -215,6 +216,18 @@ class StationControllerBase(ABC):
             raise
 ```
 
+### 3.3.1 長時間 execute 用の補助層: `ExecutionManager`
+
+`StationControllerBase` 自体には job API を入れず、HTTP / GUI / service CLI のような UX 重視面だけ **`ExecutionManager`** を併用する。
+
+- `ExecutionManager.start()` は **`controller.execute()` を丸ごと** single-worker thread に submit して即座に `ExecutionHandle` を返す
+- `ExecutionManager.get_status()` は in-memory なジョブ状態のみを返し、装置 I/O を行わない
+- `ExecutionManager.cancel()` は worker thread を kill せず、controller が任意実装した **同期 hook `cancel_execution()`** を呼ぶ
+- `cancel_execution()` が成功した場合、`_do_execute()` は **`ExecutionCancelledError`** を raise して unwind するのを標準ルールにする
+- `ExecutionManager` は `ExecutionCancelledError` を `CANCELLED` に、それ以外の例外を `FAILED` に写像する
+
+この構成により、単純な Python 利用者は従来どおり `execute()` / `execute_async()` を使い続けられ、長時間 execute による UI / HTTP ブロッキングだけを別層で吸収できる。
+
 ### 3.4 固有機能定義: `CustomAction`
 
 フレームワーク非依存の純粋なデータクラス。
@@ -268,6 +281,27 @@ class AutoSamplerDriver(StationControllerBase):
 
     async def _do_status(self) -> dict:
         return {"current_position": self._current_position}
+```
+
+安全な中断に対応したい装置だけ、次のような任意 hook を追加する。
+
+```python
+from stationkit import ExecutionCancelledError
+
+
+class AutoSamplerDriver(StationControllerBase):
+    # ... _do_connect / _do_disconnect / _do_change は省略 ...
+
+    def cancel_execution(self) -> None:
+        self._connection.send_nowait("ABORT")
+
+    async def _do_execute(self) -> dict:
+        while True:
+            response = await self._connection.recv()
+            if response == "CANCELLED":
+                raise ExecutionCancelledError("sampling aborted")
+            if response.startswith("DONE"):
+                return {"result": response}
 ```
 
 ### 4.2 固有機能を持つ装置
