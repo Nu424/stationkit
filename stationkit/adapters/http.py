@@ -1,5 +1,6 @@
 """FastAPI アプリケーションを組み立てるファクトリ。"""
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from time import perf_counter
@@ -25,6 +26,7 @@ from stationkit.core import (
     TimeoutError,
 )
 from stationkit.core.introspection import ExecuteParamsSpec, resolve_execute_params_spec
+from stationkit.execution import ExecutionHandle, ExecutionManager, ExecutionStatus
 
 
 def create_http_app(
@@ -46,10 +48,12 @@ def create_http_app(
     target_type = resolve_target_type(controller)
     execute_params_spec = resolve_execute_params_spec(controller) # executeの入力仕様をもとに、エンドポイントの形式を決定する
     app_logger = logger or get_adapter_logger("http") # httpアダプタ用のロガーを取得する
+    execution_manager = ExecutionManager(controller)
 
     # リクエストボディ用の動的モデル（change の target 型に追従）
     ConnectRequest = create_model("ConnectRequest", address=(str, ...))
     ChangeRequest = create_model("ChangeRequest", target=(target_type, ...))
+    CancelRequest = create_model("CancelRequest", execution_id=(str | None, None))
 
     # -------------------------------------------------------------------------
     # 例外ハンドリング
@@ -76,6 +80,7 @@ def create_http_app(
             operation_name="connect",
             operation=lambda: controller.connect_async(req.address),
             context={"path": "/connect"},
+            execution_manager=execution_manager,
         )
         return {"ok": True}
 
@@ -88,6 +93,7 @@ def create_http_app(
             operation_name="disconnect",
             operation=controller.disconnect_async,
             context={"path": "/disconnect"},
+            execution_manager=execution_manager,
         )
         return {"ok": True}
 
@@ -100,6 +106,8 @@ def create_http_app(
             operation_name="status",
             operation=controller.status_async,
             context={"path": "/status"},
+            execution_manager=execution_manager,
+            allow_when_running=True,
         )
 
     @app.post("/change")
@@ -114,14 +122,65 @@ def create_http_app(
                 "path": "/change",
                 "target_type": type(req.target).__name__,
             },
+            execution_manager=execution_manager,
         )
         return {"ok": True}
-    
+
     """メイン操作を実行し、結果を返す。"""
     app.post("/execute")(
-        
-        _build_execute_endpoint(controller, app_logger, execute_params_spec)
+        _build_execute_endpoint(
+            controller,
+            app_logger,
+            execute_params_spec,
+            execution_manager,
+        )
     )
+    app.post("/execute/start", response_model=ExecutionHandle)(
+        _build_execute_start_endpoint(
+            controller,
+            app_logger,
+            execute_params_spec,
+            execution_manager,
+        )
+    )
+
+    @app.get("/execute/status", response_model=ExecutionStatus)
+    async def execute_status(execution_id: str | None = None) -> ExecutionStatus:
+        """直近または指定 execute ジョブの状態を取得する。"""
+        return await _run_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="execute_status",
+            operation=lambda: asyncio.to_thread(
+                execution_manager.get_status, # execution_manager.get_status()で、実行中のexecuteの状況を取得する
+                execution_id,
+            ),
+            context={
+                "path": "/execute/status",
+                "has_execution_id": execution_id is not None,
+            },
+            allow_when_running=True,
+        )
+
+    @app.post("/execute/cancel")
+    async def execute_cancel(req: CancelRequest | None = None) -> dict[str, bool]:
+        """進行中 execute の cancel を要求する。"""
+        execution_id = None if req is None else req.execution_id
+        await _run_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="execute_cancel",
+            operation=lambda: asyncio.to_thread(
+                execution_manager.cancel, # execution_manager.cancel()で、実行中のexecuteを中断する
+                execution_id,
+            ),
+            context={
+                "path": "/execute/cancel",
+                "has_execution_id": execution_id is not None,
+            },
+            allow_when_running=True,
+        )
+        return {"ok": True}
 
     # -------------------------------------------------------------------------
     # CustomAction から動的に POST を追加
@@ -139,6 +198,7 @@ def create_http_app(
                 func=action.func,
                 input_schema=action.input_schema,
                 action_name=action.name,
+                execution_manager=execution_manager,
             )
         )
 
@@ -169,6 +229,7 @@ def _build_action_endpoint(
     func: Callable[[BaseModel], Awaitable[Any]],
     input_schema: type[BaseModel],
     action_name: str,
+    execution_manager: ExecutionManager,
 ) -> Callable[[BaseModel], Awaitable[Any]]:
     """CustomAction 用の FastAPI エンドポイント関数を生成する。
 
@@ -192,6 +253,7 @@ def _build_action_endpoint(
                 "has_params": True,
             },
             include_result=True,
+            execution_manager=execution_manager,
         )
 
     endpoint.__name__ = f"{action_name}_endpoint"
@@ -202,6 +264,7 @@ def _build_execute_endpoint(
     controller: StationControllerBase,
     logger: logging.Logger,
     params_spec: ExecuteParamsSpec,
+    execution_manager: ExecutionManager,
 ) -> Callable[..., Awaitable[Any]]:
     """execute の入力仕様に応じた FastAPI エンドポイントを返す。
     
@@ -223,6 +286,7 @@ def _build_execute_endpoint(
                 operation=controller.execute_async,
                 context={"path": "/execute", "has_params": False},
                 include_result=True,
+                execution_manager=execution_manager,
             )
 
         endpoint.__name__ = "execute_endpoint"
@@ -242,6 +306,7 @@ def _build_execute_endpoint(
                 operation=lambda: controller.execute_async(params),
                 context={"path": "/execute", "has_params": True},
                 include_result=True,
+                execution_manager=execution_manager,
             )
     else: # Noneが許容される場合
         async def endpoint(params: model_type | None = None) -> Any:
@@ -252,9 +317,77 @@ def _build_execute_endpoint(
                 operation=lambda: controller.execute_async(params),
                 context={"path": "/execute", "has_params": params is not None},
                 include_result=True,
+                execution_manager=execution_manager,
             )
 
     endpoint.__name__ = "execute_endpoint"
+    return endpoint
+
+
+def _build_execute_start_endpoint(
+    controller: StationControllerBase,
+    logger: logging.Logger,
+    params_spec: ExecuteParamsSpec,
+    execution_manager: ExecutionManager,
+) -> Callable[..., Awaitable[ExecutionHandle]]:
+    """manager ベースの execute 開始エンドポイントを返す。
+    
+    Args:
+        controller: コントローラインスタンス。
+        logger: ロガー。
+        params_spec: execute 入力仕様。
+        execution_manager: ExecutionManagerインスタンス。
+
+    Returns:
+        FastAPI に渡す async エンドポイント。
+    """
+    # ---入力を受け取らない場合は、入力不要として、_run_http_operation()を実行するエンドポイントを返す
+    if not params_spec.accepts_params:
+        async def endpoint() -> ExecutionHandle:
+            return await _run_http_operation(
+                logger=logger,
+                controller=controller,
+                operation_name="execute_start",
+                operation=lambda: asyncio.to_thread(execution_manager.start), # execution_manager.start()で、executeを開始する
+                context={"path": "/execute/start", "has_params": False},
+                allow_when_running=True,
+            )
+
+        endpoint.__name__ = "execute_start_endpoint"
+        return endpoint
+
+    # ---以下、入力を受け取る場合:
+    model_type = params_spec.model_type
+    if model_type is None:
+        raise TypeError("execute parameter spec is missing model type")
+
+    # ---Noneが許容されない場合、入力を受け取るasync関数を定義する
+    if params_spec.required:
+        async def endpoint(params: model_type) -> ExecutionHandle:
+            return await _run_http_operation(
+                logger=logger,
+                controller=controller,
+                operation_name="execute_start",
+                operation=lambda: asyncio.to_thread(execution_manager.start, params), # 入力を受け取りながら、execution_manager.start()する
+                context={"path": "/execute/start", "has_params": True},
+                allow_when_running=True,
+            )
+    else:
+        # ---Noneが許容される場合、NoneもOKなasync関数を定義する
+        async def endpoint(params: model_type | None = None) -> ExecutionHandle:
+            return await _run_http_operation(
+                logger=logger,
+                controller=controller,
+                operation_name="execute_start",
+                operation=lambda: asyncio.to_thread(execution_manager.start, params),
+                context={
+                    "path": "/execute/start",
+                    "has_params": params is not None,
+                },
+                allow_when_running=True,
+            )
+
+    endpoint.__name__ = "execute_start_endpoint"
     return endpoint
 
 
@@ -266,8 +399,24 @@ async def _run_http_operation(
     operation: Callable[[], Awaitable[Any]],
     context: dict[str, Any] | None = None,
     include_result: bool = False,
+    execution_manager: ExecutionManager | None = None,
+    allow_when_running: bool = False,
 ) -> Any:
-    """HTTP 境界でログを出しつつ controller 操作を 1 回実行する。"""
+    """HTTP 境界でログを出しつつ controller 操作を 1 回実行する。
+    
+    Args:
+        logger: ロガー。
+        controller: コントローラインスタンス。
+        operation_name: 操作名。
+        operation: 操作関数。
+        context: コンテキスト。
+        include_result: 結果を含めるかどうか。
+        execution_manager: ExecutionManagerインスタンス。
+        allow_when_running: 実行中の場合に許可するかどうか。
+
+    Returns:
+        操作の結果。
+    """
     base_context = context or {}
     started = perf_counter()
     # ---操作開始ログを出力する
@@ -279,7 +428,13 @@ async def _run_http_operation(
         context=base_context,
     )
     try:
-        # ---操作を実行する
+        # ---execution_managerの状況を確認してから、操作を実行する
+        if (
+            execution_manager is not None
+            and not allow_when_running
+            and execution_manager.has_active_execution()
+        ):
+            raise StateError("Execution is already running.")
         result = await operation()
     except Exception as exc:
         # ---失敗した場合、操作失敗ログを出力する

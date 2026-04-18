@@ -3,7 +3,7 @@
 import json
 from collections.abc import Callable
 from importlib import import_module
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
 
 import httpx
@@ -22,6 +22,7 @@ from stationkit.core import StationControllerBase
 from stationkit.core.introspection import ExecuteParamsSpec, resolve_execute_params_spec
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
+EXECUTION_POLL_INTERVAL_S = 0.2
 LOGGER = get_adapter_logger("cli")
 
 
@@ -141,6 +142,18 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
         )
         typer.echo(f"Changed to {target}.")
 
+    app.command(name="execute-start")(
+        _build_execute_start_command(
+            params_spec=execute_params_spec,
+            controller_name=type(controller).__name__,
+        )
+    )
+    app.command(name="execute-status")(
+        _build_execute_status_command(controller_name=type(controller).__name__)
+    )
+    app.command(name="execute-cancel")(
+        _build_execute_cancel_command(controller_name=type(controller).__name__)
+    )
     app.command(name="execute")(
         _build_execute_command(
             params_spec=execute_params_spec,
@@ -270,6 +283,7 @@ def _request_service(
     server_url: str,
     path: str,
     payload: Any | None = None,
+    query: dict[str, Any] | None = None,
 ) -> Any:
     """service に HTTP リクエストを送り、JSON をパースして返す。"""
     url = f"{_normalize_server_url(server_url)}{path}"
@@ -282,9 +296,10 @@ def _request_service(
                     m,
                     url,
                     json=normalize_result(payload),
+                    params=query, # GET(GET /execute/status)用に、クエリパラメータを設定する
                 )
             else:
-                response = client.request(m, url)
+                response = client.request(m, url, params=query)
     except httpx.ConnectError as exc:
         raise ServiceClientError(
             f"Could not reach stationkit service at {server_url}: {exc}"
@@ -331,10 +346,10 @@ def _build_execute_command(
         def command(ctx: typer.Context) -> None:
             """メイン操作を実行し、結果を表示する。"""
             result = _handle_service_call(
-                lambda: _request_service("POST", _get_server_url(ctx), "/execute"),
+                lambda: _execute_via_manager(_get_server_url(ctx)),
                 operation_name="execute",
                 controller_name=controller_name,
-                log_context={"path": "/execute", "has_params": False},
+                log_context={"path": "/execute/start", "has_params": False},
             )
             typer.echo(format_cli_output(result))
 
@@ -346,38 +361,208 @@ def _build_execute_command(
         def command(ctx: typer.Context, params_json: str) -> None:
             """メイン操作を実行し、結果を表示する。"""
             result = _handle_service_call(
-                lambda: _request_service(
-                    "POST",
+                lambda: _execute_via_manager(
                     _get_server_url(ctx),
-                    "/execute",
                     _parse_execute_payload(params_spec, params_json),
                 ),
                 operation_name="execute",
                 controller_name=controller_name,
-                log_context={"path": "/execute", "has_params": True},
+                log_context={"path": "/execute/start", "has_params": True},
             )
             typer.echo(format_cli_output(result))
     else: # ---executeが、パラメータ任意の場合
         def command(ctx: typer.Context, params_json: str = "") -> None:
             """メイン操作を実行し、結果を表示する。"""
             result = _handle_service_call(
-                lambda: _request_service(
-                    "POST",
+                lambda: _execute_via_manager(
                     _get_server_url(ctx),
-                    "/execute",
                     _parse_execute_payload(params_spec, params_json),
                 ),
                 operation_name="execute",
                 controller_name=controller_name,
                 log_context={
-                    "path": "/execute",
-                    "has_params": bool(params_json.strip()), # ここが違うだけ？
+                    "path": "/execute/start",
+                    "has_params": bool(params_json.strip()),
                 },
             )
             typer.echo(format_cli_output(result))
 
     command.__name__ = "execute_command"
     return command
+
+
+def _build_execute_start_command(
+    params_spec: ExecuteParamsSpec,
+    controller_name: str,
+) -> Callable[..., None]:
+    """execute-start 用 CLI コマンドを入力仕様に応じて生成する。"""
+    # ---入力を受け取らない場合のコマンドをつくる
+    if not params_spec.accepts_params:
+        def command(ctx: typer.Context) -> None:
+            """メイン操作を開始し、execution id を表示する。"""
+            handle = _handle_service_call(
+                lambda: _request_service("POST", _get_server_url(ctx), "/execute/start"),
+                operation_name="execute_start",
+                controller_name=controller_name,
+                log_context={"path": "/execute/start", "has_params": False},
+            )
+            typer.echo(format_cli_output(handle))
+
+        command.__name__ = "execute_start_command"
+        return command
+
+    # ---入力を受け取る場合のコマンドをつくる
+    if params_spec.required: # ---入力が必須の場合
+        def command(ctx: typer.Context, params_json: str) -> None:
+            """メイン操作を開始し、execution id を表示する。"""
+            handle = _handle_service_call(
+                lambda: _request_service(
+                    "POST",
+                    _get_server_url(ctx),
+                    "/execute/start",
+                    _parse_execute_payload(params_spec, params_json),
+                ),
+                operation_name="execute_start",
+                controller_name=controller_name,
+                log_context={"path": "/execute/start", "has_params": True},
+            )
+            typer.echo(format_cli_output(handle))
+    else: # ---入力が任意の場合
+        def command(ctx: typer.Context, params_json: str = "") -> None:
+            """メイン操作を開始し、execution id を表示する。"""
+            handle = _handle_service_call(
+                lambda: _request_service(
+                    "POST",
+                    _get_server_url(ctx),
+                    "/execute/start",
+                    _parse_execute_payload(params_spec, params_json),
+                ),
+                operation_name="execute_start",
+                controller_name=controller_name,
+                log_context={
+                    "path": "/execute/start",
+                    "has_params": bool(params_json.strip()),
+                },
+            )
+            typer.echo(format_cli_output(handle))
+
+    command.__name__ = "execute_start_command"
+    return command
+
+
+def _build_execute_status_command(controller_name: str) -> Callable[..., None]:
+    """execute-status 用 CLI コマンドを生成する。"""
+    def command(
+        ctx: typer.Context,
+        execution_id: str | None = typer.Option(
+            None,
+            "--execution-id",
+            help="確認対象の execution id。省略時は直近実行。",
+        ),
+    ) -> None:
+        """実行状態を表示する。"""
+        status = _handle_service_call(
+            lambda: _request_service(
+                "GET",
+                _get_server_url(ctx),
+                "/execute/status",
+                query=_build_execution_query(execution_id),
+            ),
+            operation_name="execute_status",
+            controller_name=controller_name,
+            log_context={
+                "path": "/execute/status",
+                "has_execution_id": execution_id is not None,
+            },
+        )
+        typer.echo(format_cli_output(status))
+
+    command.__name__ = "execute_status_command"
+    return command
+
+
+def _build_execute_cancel_command(controller_name: str) -> Callable[..., None]:
+    """execute-cancel 用 CLI コマンドを生成する。"""
+    def command(
+        ctx: typer.Context,
+        execution_id: str | None = typer.Option(
+            None,
+            "--execution-id",
+            help="cancel 対象の execution id。省略時は直近実行。",
+        ),
+    ) -> None:
+        """進行中の execute に cancel を要求する。"""
+        _handle_service_call(
+            lambda: _request_service(
+                "POST",
+                _get_server_url(ctx),
+                "/execute/cancel",
+                _build_execution_payload(execution_id),
+            ),
+            operation_name="execute_cancel",
+            controller_name=controller_name,
+            log_context={
+                "path": "/execute/cancel",
+                "has_execution_id": execution_id is not None,
+            },
+        )
+        typer.echo("Cancellation requested.")
+
+    command.__name__ = "execute_cancel_command"
+    return command
+
+
+def _execute_via_manager(
+    server_url: str,
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    """manager-backed な execute 開始と polling を同期的に行う。"""
+    # ---POST(POST /execute/start)で、executeを開始する
+    handle = _request_service("POST", server_url, "/execute/start", payload)
+    if not isinstance(handle, dict) or "execution_id" not in handle:
+        raise ServiceClientError("Service did not return an execution id.")
+
+    # ---executeの状況をポーリングし、SUCCEEDED/FAILED/CANCELLEDのいずれかになるまで待つ
+    execution_id = str(handle["execution_id"])
+    while True:
+        status = _request_service(
+            "GET",
+            server_url,
+            "/execute/status",
+            query=_build_execution_query(execution_id),
+        )
+        if not isinstance(status, dict):
+            raise ServiceClientError("Service returned an invalid execution status.")
+
+        state = str(status.get("state"))
+        if state in {"RUNNING", "CANCELLING"}:
+            sleep(EXECUTION_POLL_INTERVAL_S)
+            continue
+        if state == "SUCCEEDED":
+            return status.get("result")
+        if state == "FAILED":
+            raise ServiceClientError(
+                str(status.get("error_message") or "Execution failed.")
+            )
+        if state == "CANCELLED":
+            raise ServiceClientError(
+                str(status.get("error_message") or "Execution cancelled.")
+            )
+        raise ServiceClientError(f"Unknown execution state: {state}")
+
+
+def _build_execution_query(execution_id: str | None) -> dict[str, Any] | None:
+    """execution 系 GET 用の query dict を組み立てる。"""
+    if execution_id is None:
+        return None
+    return {"execution_id": execution_id}
+
+
+def _build_execution_payload(execution_id: str | None) -> dict[str, Any] | None:
+    """execution 系 POST 用の payload dict を組み立てる。"""
+    if execution_id is None:
+        return None
+    return {"execution_id": execution_id}
 
 
 def _parse_execute_payload(

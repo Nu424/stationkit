@@ -27,8 +27,9 @@ from stationkit._logging import (
     log_operation_success,
 )
 from stationkit.adapters._shared import normalize_result, resolve_target_type
-from stationkit.core import CustomAction, StationControllerBase
+from stationkit.core import CustomAction, StateError, StationControllerBase
 from stationkit.core.introspection import ExecuteParamsSpec, resolve_execute_params_spec
+from stationkit.execution import ExecutionManager, ExecutionState, ExecutionStatus
 
 LOGGER = get_adapter_logger("gui")
 
@@ -77,6 +78,7 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
     target_type = resolve_target_type(controller)
     execute_params_spec = resolve_execute_params_spec(controller)
     operation_lock = Lock()
+    execution_manager = ExecutionManager(controller)
     custom_actions = controller.get_custom_actions()
     execute_inputs: list[gr.Component] = []
 
@@ -108,7 +110,8 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
                     default=None,
                 )
                 change_button = gr.Button("Change")
-                execute_button = gr.Button("Execute", variant="secondary")
+                execute_button = gr.Button("Start Execute", variant="secondary")
+                cancel_button = gr.Button("Cancel Execute")
             # ---executeの入力仕様に応じて、Gradioコンポーネントを生成する
             execute_inputs = _render_execute_inputs(execute_params_spec)
 
@@ -123,26 +126,56 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
 
         # --- イベント登録：標準操作 ---
         connect_button.click(
-            fn=_build_connect_handler(controller, operation_lock),
+            fn=_build_connect_handler(
+                controller,
+                operation_lock,
+                execution_manager=execution_manager,
+            ),
             inputs=[address_input],
             outputs=[message_output, result_output, status_output],
         )
         disconnect_button.click(
-            fn=_build_disconnect_handler(controller, operation_lock),
+            fn=_build_disconnect_handler(
+                controller,
+                operation_lock,
+                execution_manager=execution_manager,
+            ),
             outputs=[message_output, result_output, status_output],
         )
         refresh_button.click(
-            fn=_build_refresh_handler(controller, operation_lock),
+            fn=_build_refresh_handler(
+                controller,
+                operation_lock,
+                execution_manager=execution_manager,
+            ),
             outputs=[message_output, result_output, status_output],
         )
         change_button.click(
-            fn=_build_change_handler(controller, operation_lock, target_type),
+            fn=_build_change_handler(
+                controller,
+                operation_lock,
+                target_type,
+                execution_manager=execution_manager,
+            ),
             inputs=[target_component],
             outputs=[message_output, result_output, status_output],
         )
         execute_button.click(
-            fn=_build_execute_handler(controller, operation_lock, execute_params_spec),
+            fn=_build_execute_handler(
+                controller,
+                operation_lock,
+                execute_params_spec,
+                execution_manager=execution_manager,
+            ),
             inputs=execute_inputs,
+            outputs=[message_output, result_output, status_output],
+        )
+        cancel_button.click(
+            fn=_build_cancel_execute_handler(
+                controller,
+                operation_lock,
+                execution_manager,
+            ),
             outputs=[message_output, result_output, status_output],
         )
 
@@ -152,12 +185,17 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
                 action=action,
                 controller=controller,
                 operation_lock=operation_lock,
+                execution_manager=execution_manager,
                 outputs=[message_output, result_output, status_output],
             )
 
         # --- 初期表示：ステータス読み込み ---
         app.load(
-            fn=_build_refresh_handler(controller, operation_lock),
+            fn=_build_refresh_handler(
+                controller,
+                operation_lock,
+                execution_manager=execution_manager,
+            ),
             outputs=[message_output, result_output, status_output],
         )
 
@@ -173,6 +211,7 @@ def _render_custom_action(
     action: CustomAction,
     controller: StationControllerBase,
     operation_lock: Lock,
+    execution_manager: ExecutionManager | None,
     outputs: list[gr.Component],
 ) -> None:
     """1 件の CustomAction について、アコーディオン内に入力 UI と実行ボタンを追加する。
@@ -207,6 +246,7 @@ def _render_custom_action(
                     operation_lock=operation_lock,
                     action=action,
                     field_bindings=field_bindings,
+                    execution_manager=execution_manager,
                 ),
                 inputs=inputs,
                 outputs=outputs,
@@ -225,6 +265,7 @@ def _render_custom_action(
                 controller=controller,
                 operation_lock=operation_lock,
                 action=action,
+                execution_manager=execution_manager,
             ),
             inputs=[params_input],
             outputs=outputs,
@@ -274,6 +315,7 @@ def _render_execute_inputs(params_spec: ExecuteParamsSpec) -> list[gr.Component]
 def _build_connect_handler(
     controller: StationControllerBase,
     operation_lock: Lock,
+    execution_manager: ExecutionManager | None = None,
 ) -> Callable[[str], Awaitable[tuple[str, Any, dict[str, Any]]]]:
     """「接続」ボタン用の非同期ハンドラを返す。
 
@@ -297,6 +339,7 @@ def _build_connect_handler(
             operation_name="connect",
             success_message="Connected.",
             log_context={"address_provided": bool(address)},
+            execution_manager=execution_manager,
         )
 
     return handle_connect
@@ -305,6 +348,7 @@ def _build_connect_handler(
 def _build_disconnect_handler(
     controller: StationControllerBase,
     operation_lock: Lock,
+    execution_manager: ExecutionManager | None = None,
 ) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
     """「切断」ボタン用の非同期ハンドラを返す。
 
@@ -324,6 +368,7 @@ def _build_disconnect_handler(
             operation=controller.disconnect_async,
             operation_name="disconnect",
             success_message="Disconnected.",
+            execution_manager=execution_manager,
         )
 
     return handle_disconnect
@@ -332,6 +377,7 @@ def _build_disconnect_handler(
 def _build_refresh_handler(
     controller: StationControllerBase,
     operation_lock: Lock,
+    execution_manager: ExecutionManager | None = None,
 ) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
     """「ステータス更新」および初期 ``load`` 用の非同期ハンドラを返す。
 
@@ -353,6 +399,9 @@ def _build_refresh_handler(
             operation=_noop_async,
             operation_name="status",
             success_message="Status refreshed.",
+            execution_manager=execution_manager,
+            allow_when_running=True,
+            include_execution_result=True,
         )
 
     return handle_refresh
@@ -362,6 +411,7 @@ def _build_change_handler(
     controller: StationControllerBase,
     operation_lock: Lock,
     target_type: Any,
+    execution_manager: ExecutionManager | None = None,
 ) -> Callable[[Any], Awaitable[tuple[str, Any, dict[str, Any]]]]:
     """「切替」ボタン用の非同期ハンドラを返す。
 
@@ -388,6 +438,7 @@ def _build_change_handler(
             operation_name="change",
             success_message="Target changed.",
             log_context={"target_type": target_type.__name__},
+            execution_manager=execution_manager,
         )
 
     return handle_change
@@ -397,35 +448,67 @@ def _build_execute_handler(
     controller: StationControllerBase,
     operation_lock: Lock,
     params_spec: ExecuteParamsSpec,
+    execution_manager: ExecutionManager | None = None,
 ) -> Callable[..., Awaitable[tuple[str, Any, dict[str, Any]]]]:
-    """「実行」ボタン用の非同期ハンドラを返す。
+    """「実行開始」ボタン用の非同期ハンドラを返す。
 
     Args:
         controller: 共有コントローラ。
         operation_lock: 操作の逐次化に使うロック。
 
     Returns:
-        execute 入力 UI から得た値を受け取り、``execute_async`` を実行して
-        戻り値を正規化した ``result`` と最新 ``status`` を返すコルーチン。
+        execute 入力 UI から得た値を受け取り、開始結果と最新 ``status`` を返す
+        コルーチン。``execution_manager`` がある場合は非ブロッキングに開始する。
     """
     async def handle_execute(*raw_values: Any) -> tuple[str, Any, dict[str, Any]]:
-        async def execute() -> Any:
-            # ---executeの入力仕様に応じて、値をパースする
-            params = _parse_execute_input(params_spec, raw_values)
-            # ---executeを実行する
-            return await controller.execute_async(params)
+        # ---executeの入力仕様に応じて、値をパースする
+        params = _parse_execute_input(params_spec, raw_values)
+        # ---execution_managerがNoneの場合、直接controller.execute_async()を実行する(従来通り)
+        if execution_manager is None:
+            async def execute() -> Any:
+                return await controller.execute_async(params)
 
-        return await _run_controller_action(
+            return await _run_controller_action(
+                controller=controller,
+                operation_lock=operation_lock,
+                operation=execute,
+                operation_name="execute",
+                success_message="Execution completed.",
+                include_result=True,
+                log_context={"input_arity": len(raw_values)},
+            )
+
+        # ---execution_managerが存在する場合、execution_managerを使ってexecuteを非ブロッキングに開始する
+        return await _run_manager_execute_action(
             controller=controller,
             operation_lock=operation_lock,
-            operation=execute,
-            operation_name="execute",
-            success_message="Execution completed.",
-            include_result=True,
+            execution_manager=execution_manager,
+            params=params,
             log_context={"input_arity": len(raw_values)},
         )
 
     return handle_execute
+
+
+def _build_cancel_execute_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    execution_manager: ExecutionManager,
+) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """「実行キャンセル」ボタン用ハンドラを返す。"""
+
+    async def handle_cancel() -> tuple[str, Any, dict[str, Any]]:
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=lambda: asyncio.to_thread(execution_manager.cancel),
+            operation_name="execute_cancel",
+            success_message="Cancellation requested.",
+            execution_manager=execution_manager,
+            allow_when_running=True,
+        )
+
+    return handle_cancel
 
 
 # -----------------------------------------------------------------------------
@@ -438,6 +521,7 @@ def _build_action_fields_handler(
     operation_lock: Lock,
     action: CustomAction,
     field_bindings: list[_FieldBinding],
+    execution_manager: ExecutionManager | None = None,
 ) -> Callable[..., Awaitable[tuple[str, Any, dict[str, Any]]]]:
     """フィールド分割ウィジェットから CustomAction を実行するハンドラを返す。
 
@@ -472,6 +556,7 @@ def _build_action_fields_handler(
             success_message=f"Action '{action.name}' completed.",
             include_result=True,
             log_context={"has_params": True},
+            execution_manager=execution_manager,
         )
 
     return handle_action
@@ -481,6 +566,7 @@ def _build_action_json_handler(
     controller: StationControllerBase,
     operation_lock: Lock,
     action: CustomAction,
+    execution_manager: ExecutionManager | None = None,
 ) -> Callable[[str], Awaitable[tuple[str, Any, dict[str, Any]]]]:
     """JSON テキストから CustomAction を実行するハンドラを返す。
 
@@ -507,6 +593,7 @@ def _build_action_json_handler(
             success_message=f"Action '{action.name}' completed.",
             include_result=True,
             log_context={"has_params": True},
+            execution_manager=execution_manager,
         )
 
     return handle_action
@@ -524,7 +611,10 @@ async def _run_controller_action(
     operation_name: str,
     success_message: str,
     include_result: bool = False,
+    include_execution_result: bool = False,
     log_context: dict[str, Any] | None = None,
+    execution_manager: ExecutionManager | None = None,
+    allow_when_running: bool = False,
 ) -> tuple[str, Any, dict[str, Any]]:
     """ロック下で ``operation`` を 1 回実行し、メッセージ・結果・状態をまとめて返す。
 
@@ -538,6 +628,7 @@ async def _run_controller_action(
         operation: 引数なしの async 操作（例: ``controller.disconnect_async``）。
         success_message: 成功時に UI に表示するメッセージ。
         include_result: True のとき ``operation`` の戻り値を ``normalize_result`` して返す。
+        include_execution_result: True のとき execution status から表示用 result を補う。
 
     Returns:
         ``(message, result, status)``。``result`` は ``include_result`` が False のとき ``None``。
@@ -553,10 +644,17 @@ async def _run_controller_action(
     )
     async with _hold_lock(operation_lock):
         try:
+            # ---execution_managerが存在する場合、execution_managerの状況を確認する
+            if (
+                execution_manager is not None
+                and not allow_when_running
+                and execution_manager.has_active_execution()
+            ):
+                raise StateError("Execution is already running.")
             result = await operation()
-            status = await _safe_status(controller)
+            status = await _safe_status(controller, execution_manager)
         except Exception as exc:
-            status = await _safe_status(controller)
+            status = await _safe_status(controller, execution_manager)
             log_operation_failure(
                 LOGGER,
                 layer="gui",
@@ -576,8 +674,64 @@ async def _run_controller_action(
         duration_ms=(perf_counter() - started) * 1000,
         context=context,
     )
-    display_result = normalize_result(result) if include_result else None
+    display_result = None
+    if include_result: # controller側の実行結果を、display_resultに格納する
+        display_result = normalize_result(result)
+    elif include_execution_result: # execution_manager側の実行結果を、display_resultに格納する
+        display_result = _extract_execution_result(status)
     return success_message, display_result, status
+
+
+async def _run_manager_execute_action(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    execution_manager: ExecutionManager,
+    params: Any | None,
+    log_context: dict[str, Any] | None = None,
+) -> tuple[str, Any, dict[str, Any]]:
+    """manager を使って execute を開始し、即座に状態を返す。"""
+    context = log_context or {}
+    started = perf_counter()
+    log_operation_start(
+        LOGGER,
+        layer="gui",
+        operation_name="execute_start",
+        controller_name=type(controller).__name__,
+        context=context,
+    )
+    try:
+        async with _hold_lock(operation_lock):
+            if execution_manager.has_active_execution():
+                raise StateError("Execution is already running.")
+            # ---execution_manager.start()で、executeを開始する
+            handle = await asyncio.to_thread(execution_manager.start, params)
+
+        status = await _safe_status(controller, execution_manager)
+        log_operation_success(
+            LOGGER,
+            layer="gui",
+            operation_name="execute_start",
+            controller_name=type(controller).__name__,
+            duration_ms=(perf_counter() - started) * 1000,
+            context={**context, "execution_id": handle.execution_id},
+        )
+        return (
+            f"Execution started: {handle.execution_id}",
+            None,
+            status,
+        )
+    except Exception as exc:
+        status = await _safe_status(controller, execution_manager)
+        log_operation_failure(
+            LOGGER,
+            layer="gui",
+            operation_name="execute_start",
+            controller_name=type(controller).__name__,
+            duration_ms=(perf_counter() - started) * 1000,
+            context=context,
+            exc=exc,
+        )
+        return f"Error: {exc}", None, status
 
 
 # -----------------------------------------------------------------------------
@@ -892,7 +1046,10 @@ def _json_placeholder(value_type: Any) -> str:
 # -----------------------------------------------------------------------------
 
 
-async def _safe_status(controller: StationControllerBase) -> dict[str, Any]:
+async def _safe_status(
+    controller: StationControllerBase,
+    execution_manager: ExecutionManager | None = None,
+) -> dict[str, Any]:
     """``status_async()`` を呼び、失敗時も最低限の dict を返す。
 
     Args:
@@ -903,12 +1060,38 @@ async def _safe_status(controller: StationControllerBase) -> dict[str, Any]:
         ``status_error`` キーを含む dict。
     """
     try:
-        return await controller.status_async()
+        status = await controller.status_async()
     except Exception as exc:
-        return {
+        status = {
             "controller_state": controller.state.name,
             "status_error": str(exc),
         }
+    execution_status = _try_get_execution_status(execution_manager)
+    if execution_status is not None:
+        status["execution"] = normalize_result(execution_status)
+    return status
+
+
+def _extract_execution_result(status: dict[str, Any]) -> Any:
+    """status dict から表示用の execution result を取り出す。"""
+    execution = status.get("execution")
+    if not isinstance(execution, dict):
+        return None
+    if execution.get("state") != ExecutionState.SUCCEEDED:
+        return None
+    return execution.get("result")
+
+
+def _try_get_execution_status(
+    execution_manager: ExecutionManager | None,
+) -> ExecutionStatus | None:
+    """取得可能なら execution status を返す。"""
+    if execution_manager is None:
+        return None
+    try:
+        return execution_manager.get_status()
+    except StateError:
+        return None
 
 
 async def _noop_async() -> None:
