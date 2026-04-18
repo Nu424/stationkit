@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from threading import Lock
+from threading import Event, Lock
+from time import sleep
 from typing import Any
 
 import gradio as gr
@@ -18,6 +19,10 @@ import stationkit.adapters.gui as gui_adapter
 from stationkit import (
     ControllerState,
     CustomAction,
+    ExecutionCancelledError,
+    ExecutionManager,
+    ExecutionState,
+    StateError,
     create_cli_app,
     create_gui_app,
     create_http_app,
@@ -127,6 +132,60 @@ class OptionalExecuteController(MockStationController):
         }
 
 
+class SlowExecuteController(MockStationController):
+    """外部イベントまで execute を継続するモック。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self._release = Event()
+
+    def finish_execution(self) -> None:
+        self._release.set()
+
+    async def _do_execute(self) -> dict[str, Any]:
+        self._call_log.append("execute()")
+        self.started.set()
+        while not self._release.is_set():
+            await asyncio.sleep(0.01)
+        return {"mock": True, "target": self._current_target}
+
+
+class CancellableExecuteController(SlowExecuteController):
+    """cancel hook で execute を中断できるモック。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_calls = 0
+
+    def cancel_execution(self) -> None:
+        self.cancel_calls += 1
+        self.finish_execution()
+
+    async def _do_execute(self) -> dict[str, Any]:
+        self._call_log.append("execute()")
+        self.started.set()
+        while not self._release.is_set():
+            await asyncio.sleep(0.01)
+        raise ExecutionCancelledError("Execution cancelled.")
+
+
+def _wait_for_manager_terminal_status(
+    manager: ExecutionManager,
+    execution_id: str,
+    timeout_s: float = 1.0,
+) -> Any:
+    """manager の実行が終端状態になるまで polling する。"""
+    remaining = timeout_s
+    while remaining > 0:
+        status = manager.get_status(execution_id)
+        if status.state not in {ExecutionState.RUNNING, ExecutionState.CANCELLING}:
+            return status
+        sleep(0.02)
+        remaining -= 0.02
+    raise AssertionError("Execution did not reach a terminal state in time.")
+
+
 # -----------------------------------------------------------------------------
 # StationControllerBase（同期 API・状態）
 # -----------------------------------------------------------------------------
@@ -204,6 +263,73 @@ def test_sync_api_rejects_active_event_loop() -> None:
     asyncio.run(call_sync_api())
 
 
+def test_execution_manager_rejects_double_start_and_returns_terminal_result() -> None:
+    """manager が即時に handle を返し、二重 start を reject すること。"""
+    controller = SlowExecuteController()
+    controller.connect("COM20")
+    controller.change(4)
+    manager = ExecutionManager(controller)
+
+    handle = manager.start()
+    assert controller.started.wait(timeout=1.0)
+    assert handle.execution_id
+    assert manager.get_status(handle.execution_id).state == ExecutionState.RUNNING
+
+    with pytest.raises(StateError, match="already running"):
+        manager.start()
+
+    controller.finish_execution()
+    status = _wait_for_manager_terminal_status(manager, handle.execution_id)
+    assert status.state == ExecutionState.SUCCEEDED
+    assert status.result == {"mock": True, "target": 4}
+
+
+def test_execution_manager_maps_failures_and_cancellations() -> None:
+    """manager が FAILED / CANCELLED を区別して保持すること。"""
+    failing = FailingController()
+    failing.connect("COM21")
+    failing.change(2)
+    failing_manager = ExecutionManager(failing)
+    failed = failing_manager.start()
+    failed_status = _wait_for_manager_terminal_status(
+        failing_manager,
+        failed.execution_id,
+    )
+    assert failed_status.state == ExecutionState.FAILED
+    assert failed_status.error_message == "boom"
+
+    cancellable = CancellableExecuteController()
+    cancellable.connect("COM22")
+    cancellable.change(5)
+    cancel_manager = ExecutionManager(cancellable)
+    handle = cancel_manager.start()
+    assert cancellable.started.wait(timeout=1.0)
+
+    cancel_manager.cancel(handle.execution_id)
+    status = _wait_for_manager_terminal_status(cancel_manager, handle.execution_id)
+    assert status.state == ExecutionState.CANCELLED
+    assert status.cancel_requested is True
+    assert cancellable.cancel_calls == 1
+    assert cancellable.state == ControllerState.CONNECTED
+
+
+def test_execution_manager_reports_unsupported_cancel() -> None:
+    """cancel hook を持たない controller では cancel を reject すること。"""
+    controller = SlowExecuteController()
+    controller.connect("COM23")
+    controller.change(6)
+    manager = ExecutionManager(controller)
+    handle = manager.start()
+    assert controller.started.wait(timeout=1.0)
+
+    with pytest.raises(StateError, match="not supported"):
+        manager.cancel(handle.execution_id)
+
+    controller.finish_execution()
+    status = _wait_for_manager_terminal_status(manager, handle.execution_id)
+    assert status.state == ExecutionState.SUCCEEDED
+
+
 # -----------------------------------------------------------------------------
 # アダプタ
 # -----------------------------------------------------------------------------
@@ -266,6 +392,45 @@ def test_http_adapter_supports_required_and_optional_execute_params() -> None:
         "target": 4,
         "params": {"duration_s": 9, "rpm": None},
     }
+
+
+def test_http_adapter_exposes_execute_start_status_and_cancel() -> None:
+    """HTTP が manager-backed な start/status/cancel を公開すること。"""
+    controller = CancellableExecuteController()
+    client = TestClient(create_http_app(controller))
+    client.post("/connect", json={"address": "COM13"})
+    client.post("/change", json={"target": 3})
+
+    started = client.post("/execute/start")
+    assert started.status_code == 200
+    execution_id = started.json()["execution_id"]
+    assert controller.started.wait(timeout=1.0)
+
+    running = client.get("/execute/status", params={"execution_id": execution_id})
+    assert running.status_code == 200
+    assert running.json()["state"] == "RUNNING"
+
+    blocked_change = client.post("/change", json={"target": 5})
+    assert blocked_change.status_code == 409
+    assert blocked_change.json() == {"detail": "Execution is already running."}
+
+    cancel = client.post("/execute/cancel", json={"execution_id": execution_id})
+    assert cancel.status_code == 200
+    assert cancel.json() == {"ok": True}
+
+    remaining = 1.0
+    terminal: dict[str, Any] | None = None
+    while remaining > 0:
+        status = client.get("/execute/status", params={"execution_id": execution_id})
+        terminal = status.json()
+        if terminal["state"] == "CANCELLED":
+            break
+        sleep(0.02)
+        remaining -= 0.02
+
+    assert terminal is not None
+    assert terminal["state"] == "CANCELLED"
+    assert terminal["cancel_requested"] is True
 
 
 def test_gui_adapter_builds_blocks() -> None:
@@ -343,6 +508,81 @@ def test_gui_execute_handler_supports_required_and_optional_params() -> None:
     assert message == "Execution completed."
     assert result == {"mock": True, "target": 8, "params": None}
     assert status["controller_state"] == "CONNECTED"
+
+
+def test_gui_handlers_surface_execution_manager_state() -> None:
+    """GUI helper が manager 実行中の状態と cancel を扱えること。"""
+    controller = CancellableExecuteController()
+    controller.connect("COM14")
+    controller.change(2)
+    manager = ExecutionManager(controller)
+    handle = manager.start()
+    assert controller.started.wait(timeout=1.0)
+
+    refresh = gui_adapter._build_refresh_handler(
+        controller,
+        Lock(),
+        execution_manager=manager,
+    )
+    change = gui_adapter._build_change_handler(
+        controller,
+        Lock(),
+        int,
+        execution_manager=manager,
+    )
+    cancel = gui_adapter._build_cancel_execute_handler(controller, Lock(), manager)
+
+    refresh_message, _, refresh_status = asyncio.run(refresh())
+    assert refresh_message == "Status refreshed."
+    assert refresh_status["execution"]["state"] == "RUNNING"
+
+    change_message, _, _ = asyncio.run(change(9))
+    assert change_message == "Error: Execution is already running."
+
+    cancel_message, _, cancel_status = asyncio.run(cancel())
+    assert cancel_message == "Cancellation requested."
+    assert cancel_status["execution"]["state"] in {"CANCELLING", "CANCELLED"}
+
+    terminal = _wait_for_manager_terminal_status(manager, handle.execution_id)
+    assert terminal.state == ExecutionState.CANCELLED
+
+
+def test_gui_execute_handler_starts_without_waiting_when_manager_present() -> None:
+    """GUI execute helper が manager ありでは non-blocking に開始すること。"""
+    controller = SlowExecuteController()
+    controller.connect("COM15")
+    controller.change(4)
+    manager = ExecutionManager(controller)
+    execute = gui_adapter._build_execute_handler(
+        controller,
+        Lock(),
+        resolve_execute_params_spec(controller),
+        execution_manager=manager,
+    )
+    refresh = gui_adapter._build_refresh_handler(
+        controller,
+        Lock(),
+        execution_manager=manager,
+    )
+
+    message, result, status = asyncio.run(execute())
+
+    assert message.startswith("Execution started: ")
+    assert result is None
+    assert status["execution"]["state"] == "RUNNING"
+    assert controller.started.wait(timeout=1.0)
+
+    controller.finish_execution()
+    terminal = _wait_for_manager_terminal_status(
+        manager,
+        status["execution"]["execution_id"],
+    )
+    assert terminal.state == ExecutionState.SUCCEEDED
+
+    refresh_message, refresh_result, refresh_status = asyncio.run(refresh())
+    assert refresh_message == "Status refreshed."
+    assert refresh_result == {"mock": True, "target": 4}
+    assert refresh_status["execution"]["state"] == "SUCCEEDED"
 
 
 def test_gui_value_coercion_supports_scalar_and_json_fallback() -> None:
@@ -425,20 +665,22 @@ def test_cli_adapter_supports_service_backed_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """service-backed CLI が HTTP client として標準操作を委譲できること。"""
-    calls: list[tuple[str, str, str, Any | None]] = []
+    calls: list[tuple[str, str, str, Any | None, Any | None]] = []
     service_state = {
         "controller_state": "DISCONNECTED",
         "current_target": None,
         "call_log": [],
     }
+    execution_states: dict[str, dict[str, Any]] = {}
 
     def fake_request(
         method: str,
         server_url: str,
         path: str,
         payload: Any | None = None,
+        query: dict[str, Any] | None = None,
     ) -> Any:
-        calls.append((method, server_url, path, payload))
+        calls.append((method, server_url, path, payload, query))
 
         if path == "/connect":
             service_state["controller_state"] = "CONNECTED"
@@ -450,9 +692,27 @@ def test_cli_adapter_supports_service_backed_commands(
             service_state["call_log"].append(f"change({payload['target']})")
             return {"ok": True}
 
-        if path == "/execute":
+        if path == "/execute/start":
             service_state["call_log"].append("execute()")
-            return {"mock": True, "target": service_state["current_target"]}
+            execution_id = "exec-1"
+            execution_states[execution_id] = {
+                "state": "SUCCEEDED",
+                "result": {"mock": True, "target": service_state["current_target"]},
+            }
+            return {"execution_id": execution_id}
+
+        if path == "/execute/status":
+            execution_id = str(query["execution_id"])
+            current = execution_states[execution_id]
+            return {
+                "execution_id": execution_id,
+                "state": current["state"],
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:00:01Z",
+                "result": current["result"],
+                "error_message": None,
+                "cancel_requested": False,
+            }
 
         if path == "/status":
             return dict(service_state)
@@ -496,16 +756,24 @@ def test_cli_adapter_supports_service_backed_commands(
         '"call_log": ["connect(COM4)", "change(6)", "execute()"]}\n'
     )
     assert calls == [
-        ("POST", "http://svc.test", "/connect", {"address": "COM4"}),
-        ("POST", "http://svc.test", "/change", {"target": 6}),
-        ("POST", "http://svc.test", "/execute", None),
+        ("POST", "http://svc.test", "/connect", {"address": "COM4"}, None),
+        ("POST", "http://svc.test", "/change", {"target": 6}, None),
+        ("POST", "http://svc.test", "/execute/start", None, None),
+        (
+            "GET",
+            "http://svc.test",
+            "/execute/status",
+            None,
+            {"execution_id": "exec-1"},
+        ),
         (
             "POST",
             "http://svc.test",
             "/actions/calibrate",
             {"level": 5, "force": True},
+            None,
         ),
-        ("GET", "http://svc.test", "/status", None),
+        ("GET", "http://svc.test", "/status", None, None),
     ]
 
 
@@ -513,17 +781,35 @@ def test_cli_execute_supports_required_and_optional_params(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """service-backed CLI の execute が required / optional payload を送れること。"""
-    calls: list[tuple[str, str, str, Any | None]] = []
+    calls: list[tuple[str, str, str, Any | None, Any | None]] = []
+    payloads_by_execution_id: dict[str, Any | None] = {}
+    next_execution_id = 1
 
     def fake_request(
         method: str,
         server_url: str,
         path: str,
         payload: Any | None = None,
+        query: dict[str, Any] | None = None,
     ) -> Any:
-        calls.append((method, server_url, path, payload))
-        if path == "/execute":
-            return {"payload": payload}
+        nonlocal next_execution_id
+        calls.append((method, server_url, path, payload, query))
+        if path == "/execute/start":
+            execution_id = f"exec-{next_execution_id}"
+            next_execution_id += 1
+            payloads_by_execution_id[execution_id] = payload
+            return {"execution_id": execution_id}
+        if path == "/execute/status":
+            execution_id = str(query["execution_id"])
+            return {
+                "execution_id": execution_id,
+                "state": "SUCCEEDED",
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:00:01Z",
+                "result": {"payload": payloads_by_execution_id[execution_id]},
+                "error_message": None,
+                "cancel_requested": False,
+            }
         if path == "/connect":
             return {"ok": True}
         if path == "/change":
@@ -554,8 +840,98 @@ def test_cli_execute_supports_required_and_optional_params(
 
     assert optional_execute.exit_code == 0
     assert optional_execute.stdout == '{"payload": null}\n'
-    assert ("POST", "http://svc.test", "/execute", {"duration_s": 5, "rpm": 80}) in calls
-    assert ("POST", "http://svc.test", "/execute", None) in calls
+    assert (
+        "POST",
+        "http://svc.test",
+        "/execute/start",
+        {"duration_s": 5, "rpm": 80},
+        None,
+    ) in calls
+    assert ("POST", "http://svc.test", "/execute/start", None, None) in calls
+
+
+def test_cli_adapter_exposes_explicit_execution_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """service-backed CLI が explicit な execute commands を公開すること。"""
+    calls: list[tuple[str, str, str, Any | None, Any | None]] = []
+
+    def fake_request(
+        method: str,
+        server_url: str,
+        path: str,
+        payload: Any | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> Any:
+        calls.append((method, server_url, path, payload, query))
+        if path == "/execute/start":
+            return {"execution_id": "exec-42"}
+        if path == "/execute/status":
+            return {
+                "execution_id": "exec-42",
+                "state": "RUNNING",
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": None,
+                "result": None,
+                "error_message": None,
+                "cancel_requested": False,
+            }
+        if path == "/execute/cancel":
+            return {"ok": True}
+        raise AssertionError(f"Unexpected service path: {path}")
+
+    monkeypatch.setattr(cli_adapter, "_request_service", fake_request)
+    app = create_cli_app(AdvancedMockStationController())
+    runner = CliRunner()
+
+    started = runner.invoke(
+        app,
+        ["--server", "http://svc.test", "execute-start"],
+    )
+    status = runner.invoke(
+        app,
+        [
+            "--server",
+            "http://svc.test",
+            "execute-status",
+            "--execution-id",
+            "exec-42",
+        ],
+    )
+    cancel = runner.invoke(
+        app,
+        [
+            "--server",
+            "http://svc.test",
+            "execute-cancel",
+            "--execution-id",
+            "exec-42",
+        ],
+    )
+
+    assert started.exit_code == 0
+    assert started.stdout == '{"execution_id": "exec-42"}\n'
+    assert status.exit_code == 0
+    assert '"state": "RUNNING"' in status.stdout
+    assert cancel.exit_code == 0
+    assert cancel.stdout == "Cancellation requested.\n"
+    assert calls == [
+        ("POST", "http://svc.test", "/execute/start", None, None),
+        (
+            "GET",
+            "http://svc.test",
+            "/execute/status",
+            None,
+            {"execution_id": "exec-42"},
+        ),
+        (
+            "POST",
+            "http://svc.test",
+            "/execute/cancel",
+            {"execution_id": "exec-42"},
+            None,
+        ),
+    ]
 
 
 def test_stationkit_logging_emits_core_and_http_records(caplog: pytest.LogCaptureFixture) -> None:

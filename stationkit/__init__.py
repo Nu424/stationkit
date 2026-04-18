@@ -15,10 +15,18 @@ from stationkit.core import (
     ConnectionError,
     ControllerState,
     CustomAction,
+    ExecutionCancelledError,
     StateError,
     StationControllerBase,
     StationError,
     TimeoutError,
+)
+from stationkit.execution import (
+    ExecutionHandle,
+    ExecutionManager,
+    ExecutionState,
+    ExecutionStatus,
+    SupportsExecutionCancellation,
 )
 from stationkit.testing import MockStationController
 
@@ -31,9 +39,15 @@ __all__ = [
     "create_http_app",
     "create_local_cli_app",
     "CustomAction",
+    "ExecutionCancelledError",
+    "ExecutionHandle",
+    "ExecutionManager",
+    "ExecutionState",
+    "ExecutionStatus",
     "MockStationController",
     "StateError",
     "StationControllerBase",
     "StationError",
+    "SupportsExecutionCancellation",
     "TimeoutError",
 ]

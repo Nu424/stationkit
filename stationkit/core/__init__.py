@@ -5,6 +5,7 @@ from stationkit.core.base import StationControllerBase
 from stationkit.core.exceptions import (
     CommandError,
     ConnectionError,
+    ExecutionCancelledError,
     StateError,
     StationError,
     TimeoutError,
@@ -16,6 +17,7 @@ __all__ = [
     "ConnectionError",
     "ControllerState",
     "CustomAction",
+    "ExecutionCancelledError",
     "StateError",
     "StationControllerBase",
     "StationError",

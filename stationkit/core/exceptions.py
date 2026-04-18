@@ -26,3 +26,7 @@ class StateError(StationError):
 
     例: 未接続のまま change を呼び出した場合など。
     """
+
+
+class ExecutionCancelledError(StationError):
+    """execute が安全に中断されたことを表す。"""

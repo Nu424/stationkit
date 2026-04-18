@@ -22,7 +22,7 @@ def normalize_result(value: Any) -> Any:
         dict / list / スカラーなど JSON 化しやすい値。
     """
     if isinstance(value, BaseModel):
-        return value.model_dump()
+        return value.model_dump(mode="json")
     return value
 
 
