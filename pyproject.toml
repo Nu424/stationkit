@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "stationkit"
 version = "0.1.0"
@@ -12,13 +16,19 @@ dependencies = [
     "typer>=0.24.1",
 ]
 
-[project.scripts]
-stationkit = "main:main"
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stationkit*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
