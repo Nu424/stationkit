@@ -28,6 +28,19 @@ from stationkit.execution import (
     ExecutionStatus,
     SupportsExecutionCancellation,
 )
+from stationkit.sequence import (
+    SequenceDefinition,
+    SequenceIssue,
+    SequenceIssueSeverity,
+    SequenceMode,
+    SequenceRunHandle,
+    SequenceRunner,
+    SequenceRunState,
+    SequenceSnapshot,
+    SequenceStep,
+    SequenceStepState,
+    SequenceValidationResult,
+)
 from stationkit.testing import MockStationController
 
 __all__ = [
@@ -45,6 +58,17 @@ __all__ = [
     "ExecutionState",
     "ExecutionStatus",
     "MockStationController",
+    "SequenceDefinition",
+    "SequenceIssue",
+    "SequenceIssueSeverity",
+    "SequenceMode",
+    "SequenceRunHandle",
+    "SequenceRunner",
+    "SequenceRunState",
+    "SequenceSnapshot",
+    "SequenceStep",
+    "SequenceStepState",
+    "SequenceValidationResult",
     "StateError",
     "StationControllerBase",
     "StationError",
