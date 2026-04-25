@@ -1,0 +1,74 @@
+# Sequence Web App
+
+`apps/sequence_app/` は、`SequenceRunner` を FastAPI + React で包んだ monorepo 内アプリ領域です。
+library 側は `stationkit.adapters.sequence_http` まで、frontend 配信都合は `apps/sequence_app/server` と `apps/sequence_app/web` に切り分けています。
+
+## 構成
+
+- `server/app.py`: `create_sequence_app_server(controller, ...)`
+- `web/`: Vite + React + Tailwind + Zustand の single-page UI
+
+サンプル用の uvicorn 起動は、リポジトリルートの [`main.py`](../../main.py)（`MockStationController` を包む最小 launcher）を使います。
+
+## 開発手順
+
+### 1. Python 依存を入れる
+
+```bash
+uv sync
+```
+
+### 2. frontend 依存を入れる
+
+```bash
+cd apps/sequence_app/web
+npm install
+```
+
+### 3. backend を起動する
+
+リポジトリルートで、PowerShell:
+
+```powershell
+$env:STATIONKIT_SEQUENCE_DEV_ORIGIN = "http://127.0.0.1:5173"
+uv run python main.py
+```
+
+ルートの `main.py` は `MockStationController` を `create_sequence_app_server()` で包み、`uvicorn` で起動します。
+自分の controller を使いたい場合は、このパターンを真似した launcher script を別途作成してください。
+
+### 4. frontend dev server を起動する
+
+別ターミナルで:
+
+```powershell
+cd apps/sequence_app/web
+$env:VITE_API_BASE_URL = "http://127.0.0.1:8000"
+npm run dev
+```
+
+ブラウザで `http://127.0.0.1:5173` を開くと、backend の `/api/...` を CORS 経由で利用できます。
+
+## production 相当の起動
+
+frontend を build すると、ルートの `main.py` が `web/dist` を自動検出して同一 origin 配信します。
+
+```powershell
+cd apps/sequence_app/web
+npm run build
+cd ../../..
+uv run python main.py
+```
+
+## API-only 利用
+
+static 配信が不要なら、library 側の `create_sequence_http_app(controller)` を直接使えます。
+この場合は React build や CORS 設定を含まず、純粋な `/api/...` だけを公開します。
+
+## 手動確認チェックリスト
+
+- connect → add step → validate → run → stop
+- time-driven step の start/end 表示と countdown 表示
+- import/export roundtrip
+- single-step check の load / start
+- 実行中の disable 制御

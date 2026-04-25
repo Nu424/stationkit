@@ -7,8 +7,8 @@
 
 ## 特徴
 
-- **1 つのコントローラ実装から、4 つの使い方が一斉に派生する**
-  ライブラリ呼び出し / HTTP サーバー / CLI / Gradio GUI を、同じ `StationControllerBase` 実装から生成できます。
+- **1 つのコントローラ実装から、5 つの使い方へ展開できる**
+  ライブラリ呼び出し / HTTP サーバー / CLI / Gradio GUI / Sequence Web App を、同じ `StationControllerBase` 実装から組み立てられます。
 - **sync / async の二重実装が不要**
   装置固有のロジックは `_do_*` を **async** で 1 度書けば、同期 API（`connect` など）と非同期 API（`connect_async` など）の両方が自動で提供されます。
 - **型ヒントから入出力スキーマを自動解決**
@@ -31,6 +31,7 @@
 - [長時間 execute を別層で扱う（ExecutionManager）](#長時間-execute-を別層で扱うexecutionmanager)
 - [HTTP サーバーとして動かす](#http-サーバーとして動かす)
 - [CLI として動かす](#cli-として動かす)
+- [Sequence Web App として動かす](#sequence-web-app-として動かす)
 - [Gradio GUI として動かす](#gradio-gui-として動かす)
 - [ロギング](#ロギング)
 - [テスト](#テスト)
@@ -60,8 +61,9 @@ uv sync --group dev
 |------|------|
 | `stationkit.core` | `StationControllerBase`、状態 (`ControllerState`)、例外階層、`CustomAction` |
 | `stationkit.execution` | `ExecutionManager`（長時間 execute の別スレッド管理）と関連モデル |
-| `stationkit.adapters` | `create_http_app` (FastAPI) / `create_cli_app` (service-backed CLI) / `create_local_cli_app` (同一プロセス) / `create_gui_app` (Gradio) |
+| `stationkit.adapters` | `create_http_app` (FastAPI) / `create_sequence_http_app` (Sequence API) / `create_cli_app` (service-backed CLI) / `create_local_cli_app` (同一プロセス) / `create_gui_app` (Gradio) |
 | `stationkit.testing` | `MockStationController`（実機なしでの動作確認用） |
+| `apps/sequence_app` | FastAPI + React の sequence editor / runner アプリ |
 
 主要シンボルはトップレベル（`from stationkit import ...`）から直接インポートできます。
 
@@ -409,11 +411,31 @@ from mymodule import MyDeviceController
 app = create_local_cli_app(MyDeviceController())
 ```
 
-このリポジトリ付属のデモは `main.py` にあります。また `pyproject.toml` の `[project.scripts]` で `stationkit` コマンドも定義しているため、パッケージをインストールした環境では `stationkit` で起動できます。
+service-backed CLI のサンプルを作りたい場合は、この節の `create_cli_app()` / `create_local_cli_app()` の例をそのまま launcher script に写して使ってください。
 
-```bash
-uv run python main.py --help
+## Sequence Web App として動かす
+
+シーケンス編集と実行をブラウザ UI で扱いたい場合は、`apps/sequence_app/server/app.py` の
+`create_sequence_app_server(controller, ...)` を使います。
+library 側は `create_sequence_http_app(controller)` で `/api/...` だけを提供し、
+frontend の static 配信や開発時 CORS は app wrapper 側に分離されています。
+
+```python
+import uvicorn
+
+from apps.sequence_app.server.app import create_sequence_app_server
+from mymodule import MyDeviceController
+
+controller = MyDeviceController()
+app = create_sequence_app_server(
+    controller,
+    frontend_dist_dir="apps/sequence_app/web/dist",
+)
+uvicorn.run(app, host="127.0.0.1", port=8000)
 ```
+
+このリポジトリの `main.py` は `MockStationController` をこの形で包んだ最小サンプルです。
+開発手順と手動確認項目は `apps/sequence_app/README.md` を参照してください。
 
 ## Gradio GUI として動かす
 
