@@ -11,9 +11,15 @@ from typing import Any
 import gradio as gr
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typer.testing import CliRunner
 
+from stationkit.adapters._form_inputs import (
+    input_field_specs_from_model,
+    model_uses_scalar_fields,
+    resolve_primitive_input_type,
+    supports_scalar_input,
+)
 import stationkit.adapters.cli as cli_adapter
 import stationkit.adapters.gui as gui_adapter
 from stationkit import (
@@ -75,6 +81,20 @@ class OptionalExecuteInput(BaseModel):
 
     duration_s: int | None = None
     rpm: int | None = None
+
+
+class OptionalBoolInput(BaseModel):
+    """Optional[bool] の widget 判定確認用スキーマ。"""
+
+    enabled: bool | None = None
+
+
+class FormFieldSpecInput(BaseModel):
+    """共通 field spec helper の確認用スキーマ。"""
+
+    required_level: int = Field(title="Required Level")
+    optional_ratio: float | None = Field(default=None, title="Optional Ratio")
+    enabled: bool | None = Field(default=None, title="Enabled")
 
 
 class AdvancedMockStationController(MockStationController):
@@ -611,6 +631,42 @@ def test_gui_custom_action_helpers_support_field_and_json_inputs() -> None:
         '{"config": {"slot": 4}}',
     )
     assert parsed_json == ComplexActionInput(config={"slot": 4})
+
+
+def test_form_input_helpers_build_specs_and_scalar_classification() -> None:
+    """共通 field spec helper が型分類と field 属性を保持できること。"""
+    specs = input_field_specs_from_model(FormFieldSpecInput)
+
+    assert [spec.name for spec in specs] == [
+        "required_level",
+        "optional_ratio",
+        "enabled",
+    ]
+    assert [spec.label for spec in specs] == [
+        "Required Level",
+        "Optional Ratio",
+        "Enabled",
+    ]
+    assert specs[0].required is True
+    assert specs[0].nullable is False
+    assert specs[0].primitive_type == "int"
+    assert specs[1].required is False
+    assert specs[1].nullable is True
+    assert specs[1].primitive_type == "float"
+    assert specs[2].nullable is True
+    assert specs[2].primitive_type == "bool"
+
+    assert resolve_primitive_input_type(str) == "str"
+    assert resolve_primitive_input_type(dict[str, int]) == "json"
+    assert supports_scalar_input(int | None) is True
+    assert supports_scalar_input(bool | None) is True
+    assert supports_scalar_input(bool | None, allow_optional_bool=False) is False
+    assert model_uses_scalar_fields(CalibrateInput) is True
+    assert model_uses_scalar_fields(OptionalBoolInput) is True
+    assert model_uses_scalar_fields(
+        OptionalBoolInput,
+        allow_optional_bool=False,
+    ) is False
 
 
 def test_local_cli_adapter_supports_core_and_custom_commands() -> None:

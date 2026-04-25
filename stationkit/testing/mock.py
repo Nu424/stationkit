@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
 from typing import Any
 
 from stationkit.core import StationControllerBase
@@ -56,6 +58,9 @@ class MockStationController(StationControllerBase):
             ``mock`` フラグと現在ターゲットを含む dict。
         """
         self._call_log.append("execute()")
+        await asyncio.sleep(random.randint(1, 10))
+        self._call_log.append("execute() completed")
+
         return {"mock": True, "target": self._current_target}
 
     async def _do_status(self) -> dict[str, Any]:
