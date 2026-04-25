@@ -74,6 +74,30 @@ def resolve_target_type(controller: Any) -> type[Any]:
     return target_type
 
 
+def unwrap_optional_type(annotation: Any) -> tuple[Any, bool]:
+    """`Optional[T]` または `T | None` を分解する。
+
+    Args:
+        annotation: 判定対象の型注釈。
+
+    Returns:
+        `(実体型, None を許容するか)` のタプルを返す。
+        `Optional[T]` / `T | None` と解釈できない場合は
+        `(annotation, False)` を返す。
+    """
+    # Optional 判定は core / adapter 双方で使うため、ここで一元化する。
+    origin = get_origin(annotation)
+    if origin not in {Union, UnionType}:
+        return annotation, False
+
+    args = get_args(annotation)
+    non_none_args = [arg for arg in args if arg is not NoneType]
+    if len(non_none_args) == 1 and len(non_none_args) != len(args):
+        # 全args数とnon_none_args数が一致しない場合は、一部がNoneTypeであり、optionalであることを示す
+        return non_none_args[0], True
+    return annotation, False
+
+
 def resolve_execute_params_spec(controller: Any) -> ExecuteParamsSpec:
     """``_do_execute`` の execute 入力仕様を解決する。
 
@@ -201,21 +225,14 @@ def _resolve_execute_model_type(
     if _is_pydantic_model(annotation):
         return annotation, False
 
-    # Optional[T] / T | None を許可するため、Union をほどいて判定する。
-    origin = get_origin(annotation)
-    if origin not in (UnionType, Union):
-        # ここに来るのは、Pydantic モデルでも Optional/Union でもない型。
-        # 例: int, str, bool, list, dict, NoneType など。
-        return None, False
+    # Optional[T] / T | None をほどき、`モデル型 1 個 + None` だけを受け入れる。
+    unwrapped, accepts_none = unwrap_optional_type(annotation)
+    if accepts_none and _is_pydantic_model(unwrapped):
+        return unwrapped, True
 
-    args = get_args(annotation)
-    model_candidates = [arg for arg in args if arg is not NoneType]
-    if len(model_candidates) != 1 or not _is_pydantic_model(model_candidates[0]):
-        # 受け入れたいのは「モデル型 1 個 + None」だけ。
-        # そのため、None しかない Union や、複数モデル/別型混在の Union は不受理。
-        return None, False
-    # ここに来たら「Pydantic モデル型 | None」と判断できる。
-    return model_candidates[0], NoneType in args
+    # ここに来るのは、Pydantic モデルでも Optional/Union でもない型。
+    # 例: int, str, bool, list, dict, NoneType など。
+    return None, False
 
 
 def _is_pydantic_model(annotation: Any) -> bool:

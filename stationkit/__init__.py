@@ -9,6 +9,7 @@ from stationkit.adapters import (
     create_gui_app,
     create_http_app,
     create_local_cli_app,
+    create_sequence_http_app,
 )
 from stationkit.core import (
     CommandError,
@@ -51,6 +52,7 @@ __all__ = [
     "create_gui_app",
     "create_http_app",
     "create_local_cli_app",
+    "create_sequence_http_app",
     "CustomAction",
     "ExecutionCancelledError",
     "ExecutionHandle",

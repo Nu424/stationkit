@@ -907,8 +907,17 @@ class SequenceRunner:
             status = self._execution_manager.get_status(execution_id)
             # ---状態を更新する
             self._sync_step_status(run_id, index, status)
+            now = _utcnow()
             # ---終端状態になった場合は、終端理由に応じてアウトカムを返す
             if status.state not in (ExecutionState.RUNNING, ExecutionState.CANCELLING):
+                if status.state == ExecutionState.CANCELLED:
+                    if stop_cancel_requested or self._stop_requested:
+                        return _SequenceOutcome.STOPPED
+                    if (
+                        scheduled_end is not None
+                        and (scheduled_cancel_requested or now >= scheduled_end)
+                    ):
+                        return _SequenceOutcome.SCHEDULED_END
                 if stop_cancel_requested:
                     return _SequenceOutcome.STOPPED
                 if scheduled_cancel_requested:
@@ -918,7 +927,6 @@ class SequenceRunner:
                 return _SequenceOutcome.FAILED
 
             # ---stop_requestedが立っている場合は、cancelを要求する
-            now = _utcnow()
             if self._stop_requested and not stop_cancel_requested:
                 stop_cancel_requested = True
                 if self._request_cancel(run_id, index, execution_id, "Sequence stop was requested."):
