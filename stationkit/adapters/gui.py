@@ -13,12 +13,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from threading import Lock
 from time import perf_counter
-from types import NoneType, UnionType
-from typing import Any, Union, get_args, get_origin
+from typing import Any
 
 import gradio as gr
 from pydantic import BaseModel, TypeAdapter
-from pydantic.fields import FieldInfo
 
 from stationkit._logging import (
     get_adapter_logger,
@@ -26,9 +24,18 @@ from stationkit._logging import (
     log_operation_start,
     log_operation_success,
 )
+from stationkit.adapters._form_inputs import (
+    input_field_specs_from_model,
+    model_uses_scalar_fields,
+    supports_scalar_input,
+)
 from stationkit.adapters._shared import normalize_result, resolve_target_type
 from stationkit.core import CustomAction, StateError, StationControllerBase
-from stationkit.core.introspection import ExecuteParamsSpec, resolve_execute_params_spec
+from stationkit.core.introspection import (
+    ExecuteParamsSpec,
+    resolve_execute_params_spec,
+    unwrap_optional_type,
+)
 from stationkit.execution import ExecutionManager, ExecutionState, ExecutionStatus
 
 LOGGER = get_adapter_logger("gui")
@@ -748,9 +755,10 @@ def _input_schema_uses_field_widgets(input_schema: type[BaseModel]) -> bool:
     Returns:
         すべてのフィールドが :func:`_supports_native_component` を満たすとき True。
     """
-    return all(
-        _supports_native_component(field.annotation)
-        for field in input_schema.model_fields.values()
+    # Optional[bool] は Checkbox で `None` を表現しづらいため GUI 側では除外する。
+    return model_uses_scalar_fields(
+        input_schema,
+        allow_optional_bool=False,
     )
 
 
@@ -764,14 +772,16 @@ def _build_field_bindings(input_schema: type[BaseModel]) -> list[_FieldBinding]:
     Returns:
         ``model_fields`` の定義順に並べたバインディング一覧。
     """
+    # Pydantic field の列挙や default 解決は共通 helper 側へ寄せる。
+    # ---InputFieldSpecを_FieldBindingに変換して、listにする
     bindings: list[_FieldBinding] = []
-    for name, field in input_schema.model_fields.items():
+    for spec in input_field_specs_from_model(input_schema):
         bindings.append(
             _FieldBinding(
-                name=name,
-                annotation=field.annotation,
-                label=field.title or name,
-                default=_field_default(field),
+                name=spec.name,
+                annotation=spec.annotation,
+                label=spec.label,
+                default=spec.default,
             )
         )
     return bindings
@@ -890,14 +900,14 @@ def _create_value_component(
     """型に応じて Checkbox / Number / Textbox（または JSON 用 Textbox）を生成する。
 
     Args:
-        value_type: 対象の Python 型（``Optional`` は :func:`_unwrap_optional` で解釈）。
+        value_type: 対象の Python 型（``Optional`` は :func:`unwrap_optional_type` で解釈）。
         label: コンポーネントのラベル。
         default: 初期値。未設定のときは型に応じて空欄や False を使う。
 
     Returns:
         対応する Gradio 入力コンポーネント。
     """
-    base_type, is_optional = _unwrap_optional(value_type)
+    base_type, is_optional = unwrap_optional_type(value_type)
 
     # ---各種型に合わせて、対応するGradioコンポーネントを生成する
     if base_type is bool and not is_optional: # boolはT/Fしか持てず、Noneを表現できないので、not is_optionalにしている
@@ -973,44 +983,7 @@ def _supports_native_component(value_type: Any) -> bool:
     Returns:
         上記に該当し、かつ ``Optional[bool]`` でないとき True。
     """
-    base_type, is_optional = _unwrap_optional(value_type)
-    if is_optional and base_type is bool:
-        return False
-    return base_type in {str, int, float, bool}
-
-
-def _unwrap_optional(value_type: Any) -> tuple[Any, bool]:
-    """``Union[T, None]`` 形式を ``T`` と optional フラグに分解する。
-
-    Args:
-        value_type: 分解する型注釈。
-
-    Returns:
-        ``(実体型, is_optional)``。Union でない場合は ``(value_type, False)``。
-    """
-    origin = get_origin(value_type)
-    if origin not in {Union, UnionType}:
-        return value_type, False
-    args = get_args(value_type)
-    non_none_args = [arg for arg in args if arg is not NoneType]
-    # 全args数とnon_none_args数が一致しない場合は、一部がNoneTypeであり、optionalであることを示す
-    if len(non_none_args) == 1 and len(non_none_args) != len(args):
-        return non_none_args[0], True
-    return value_type, False
-
-
-def _field_default(field: FieldInfo) -> Any:
-    """Pydantic v2 のフィールドからデフォルト値を取得する。
-
-    Args:
-        field: ``model_fields`` の値。
-
-    Returns:
-        必須フィールドなら ``None``。それ以外は ``get_default`` の結果。
-    """
-    if field.is_required():
-        return None
-    return field.get_default(call_default_factory=True)
+    return supports_scalar_input(value_type, allow_optional_bool=False)
 
 
 def _json_default(default: Any) -> str:
