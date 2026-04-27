@@ -29,7 +29,12 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["stationkit*"]
+include = ["stationkit*", "apps", "apps.sequence_app", "apps.sequence_app.server*"]
+
+[tool.setuptools.package-data]
+"apps.sequence_app.server" = ["static/**/*"]
+# `import apps.sequence_app.server` に、データファイルを紐づけるらしい
+# これにより、パッケージインストール後もディレクトリに含めておくみたいな感じらしい
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
