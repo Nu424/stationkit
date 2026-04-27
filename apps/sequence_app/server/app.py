@@ -10,6 +10,8 @@ from fastapi.responses import FileResponse
 
 from stationkit import StationControllerBase, create_sequence_http_app
 
+_DEFAULT_FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "static"
+
 
 def create_sequence_app_server(
     controller: StationControllerBase,
@@ -27,7 +29,8 @@ def create_sequence_app_server(
     Args:
         controller: 対象コントローラ。
         frontend_dist_dir: production 用 frontend build 出力ディレクトリ。
-            存在する場合は静的配信と SPA fallback を有効化する。
+            未指定時は同梱 static を使う。存在する場合は静的配信と
+            SPA fallback を有効化する。
         dev_frontend_origin: 開発時 React dev server の origin。
             指定時は CORS を有効化する。
 
@@ -46,6 +49,8 @@ def create_sequence_app_server(
         )
 
     dist_dir = _resolve_frontend_dist_dir(frontend_dist_dir)
+    if dist_dir is None and frontend_dist_dir is None:
+        dist_dir = _resolve_frontend_dist_dir(_DEFAULT_FRONTEND_DIST_DIR)
     if dist_dir is None:
         return app
 
