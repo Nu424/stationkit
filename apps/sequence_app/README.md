@@ -51,7 +51,8 @@ npm run dev
 
 ## production 相当の起動
 
-frontend を build すると、ルートの `main.py` が `web/dist` を自動検出して同一 origin 配信します。
+frontend を build すると、`server/static` に配布用ファイルが生成されます。
+`create_sequence_app_server()` はこの同梱 static を自動検出して同一 origin 配信します。
 
 ```powershell
 cd apps/sequence_app/web
