@@ -107,9 +107,22 @@ React frontend の build 済み静的ファイルも同梱されるため、`fro
 ### コード例
 
 ```python
+import asyncio
 from typing import Any
 
-from stationkit import StationControllerBase
+from pydantic import BaseModel
+
+from stationkit import CustomAction, ExecutionCancelledError, StationControllerBase
+
+
+class CalibrateInput(BaseModel):
+    level: int
+    force: bool = False
+
+
+class CalibrateOutput(BaseModel):
+    status: str
+    level: int
 
 
 class MyDeviceController(StationControllerBase):
@@ -119,6 +132,7 @@ class MyDeviceController(StationControllerBase):
         super().__init__()
         self._address: str | None = None
         self._target: int | None = None
+        self._cancel_requested = False
 
     async def _do_connect(self, address: str) -> None:
         self._address = address
@@ -132,10 +146,41 @@ class MyDeviceController(StationControllerBase):
         self._target = target
 
     async def _do_execute(self) -> dict[str, Any]:
+        self._cancel_requested = False
+
+        # キャンセルを実装する場合:
+        # 長時間処理の途中で cancel_execution() から立てたフラグを確認し、
+        # 安全に止められる地点で ExecutionCancelledError を送出する。
+        for _ in range(10):
+            if self._cancel_requested:
+                raise ExecutionCancelledError("Execution cancelled.")
+            await asyncio.sleep(0.1)
+
         return {"address": self._address, "target": self._target}
 
     async def _do_status(self) -> dict[str, Any]:
         return {"target": self._target}
+
+    # カスタムアクションを実装する場合:
+    # Pydantic モデルで入出力を定義し、CustomAction として公開する。
+    async def _do_calibrate(self, params: CalibrateInput) -> CalibrateOutput:
+        return CalibrateOutput(status="success", level=params.level)
+
+    def get_custom_actions(self) -> list[CustomAction]:
+        return [
+            CustomAction(
+                name="calibrate",
+                description="Run calibration",
+                func=self._do_calibrate,
+                input_schema=CalibrateInput,
+                output_schema=CalibrateOutput,
+            )
+        ]
+
+    # キャンセルを実装する場合:
+    # ExecutionManager / HTTP / GUI などから同期的に呼ばれる任意 hook。
+    def cancel_execution(self) -> None:
+        self._cancel_requested = True
 ```
 
 ## 同期 API と非同期 API
