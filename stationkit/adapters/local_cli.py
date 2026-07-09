@@ -127,6 +127,12 @@ def create_local_cli_app(controller: StationControllerBase) -> typer.Typer:
         typer.echo("Disconnected.")
 
     @app.command()
+    def idle() -> None:
+        """装置を idle 状態へ移す。"""
+        handle_station_call(controller.idle, operation_name="idle")
+        typer.echo("Idled.")
+
+    @app.command()
     def status() -> None:
         """状態を表示する。"""
         result = handle_station_call(controller.status, operation_name="status")

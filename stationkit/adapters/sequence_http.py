@@ -313,6 +313,25 @@ def create_sequence_http_app(
         )
         return {"ok": True}
 
+    @app.post("/api/controller/idle")
+    async def api_idle() -> dict[str, bool]:
+        """装置を idle 状態（稼働していないときの disposition）へ移す。
+
+        Returns:
+            成功時の確認レスポンス。
+        """
+        await _run_sequence_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="idle",
+            operation=controller.idle_async,
+            context={"path": "/api/controller/idle"},
+            operation_lock=operation_lock,
+            manual_execution_manager=manual_execution_manager,
+            sequence_runner=sequence_runner,
+        )
+        return {"ok": True}
+
     @app.post("/api/controller/change")
     async def api_change(req: ChangeRequest) -> dict[str, bool]:
         """target を手動で切り替える。

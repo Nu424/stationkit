@@ -119,6 +119,7 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
                 change_button = gr.Button("Change")
                 execute_button = gr.Button("Start Execute", variant="secondary")
                 cancel_button = gr.Button("Cancel Execute")
+                idle_button = gr.Button("Go Idle")
             # ---executeの入力仕様に応じて、Gradioコンポーネントを生成する
             execute_inputs = _render_execute_inputs(execute_params_spec)
 
@@ -182,6 +183,14 @@ def create_gui_app(controller: StationControllerBase) -> gr.Blocks:
                 controller,
                 operation_lock,
                 execution_manager,
+            ),
+            outputs=[message_output, result_output, status_output],
+        )
+        idle_button.click(
+            fn=_build_idle_handler(
+                controller,
+                operation_lock,
+                execution_manager=execution_manager,
             ),
             outputs=[message_output, result_output, status_output],
         )
@@ -379,6 +388,38 @@ def _build_disconnect_handler(
         )
 
     return handle_disconnect
+
+
+def _build_idle_handler(
+    controller: StationControllerBase,
+    operation_lock: Lock,
+    execution_manager: ExecutionManager | None = None,
+) -> Callable[[], Awaitable[tuple[str, Any, dict[str, Any]]]]:
+    """「Go Idle」ボタン用の非同期ハンドラを返す。
+
+    装置を idle 状態（稼働していないときの disposition）へ手動で移す。
+    execute 実行中は ``idle`` を許可しないため、実行中は StateError になる。
+
+    Args:
+        controller: 共有コントローラ。
+        operation_lock: 操作の逐次化に使うロック。
+
+    Returns:
+        引数なしで ``(message, result, status)`` を返すコルーチン。
+        ``result`` は idle 操作では常に ``None``。
+    """
+
+    async def handle_idle() -> tuple[str, Any, dict[str, Any]]:
+        return await _run_controller_action(
+            controller=controller,
+            operation_lock=operation_lock,
+            operation=controller.idle_async,
+            operation_name="idle",
+            success_message="Idled.",
+            execution_manager=execution_manager,
+        )
+
+    return handle_idle
 
 
 def _build_refresh_handler(

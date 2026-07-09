@@ -175,6 +175,20 @@ def test_sequence_http_connect_change_and_disconnect() -> None:
     assert client.get("/api/status").json()["controller"]["controller_state"] == "DISCONNECTED"
 
 
+def test_sequence_http_manual_idle() -> None:
+    """/api/controller/idle で idle 状態へ移せること。"""
+    client = TestClient(create_sequence_http_app(MockStationController()))
+
+    client.post("/api/controller/connect", json={"address": "COM51"})
+    client.post("/api/controller/change", json={"target": 4})
+
+    assert client.post("/api/controller/idle").json() == {"ok": True}
+    assert client.get("/api/status").json()["controller"]["routing"] == "exhaust"
+
+    client.post("/api/controller/disconnect")
+    assert client.post("/api/controller/idle").status_code == 409
+
+
 def test_sequence_http_validate_and_time_driven_cancel_unsupported() -> None:
     """time-driven を cancel 未対応 controller が validation で拒否されること。"""
     client = TestClient(create_sequence_http_app(MockStationController()))

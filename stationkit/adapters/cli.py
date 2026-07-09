@@ -113,6 +113,17 @@ def create_cli_app(controller: StationControllerBase) -> typer.Typer:
         typer.echo("Disconnected.")
 
     @app.command()
+    def idle(ctx: typer.Context) -> None:
+        """装置を idle 状態へ移す。"""
+        _handle_service_call(
+            lambda: _request_service("POST", _get_server_url(ctx), "/idle"),
+            operation_name="idle",
+            controller_name=type(controller).__name__,
+            log_context={"path": "/idle"},
+        )
+        typer.echo("Idled.")
+
+    @app.command()
     def status(ctx: typer.Context) -> None:
         """状態を表示する。"""
         result = _handle_service_call(
