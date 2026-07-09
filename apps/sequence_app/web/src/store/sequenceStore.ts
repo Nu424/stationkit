@@ -41,6 +41,7 @@ interface SequenceStore {
   refreshStatus: () => Promise<void>
   connect: (address: string) => Promise<void>
   disconnect: () => Promise<void>
+  idle: () => Promise<void>
   changeTarget: (target: unknown) => Promise<void>
   setSequenceName: (name: string) => void
   setSequenceMode: (mode: SequenceMode) => void
@@ -305,6 +306,18 @@ export const useSequenceStore = create<SequenceStore>()(
           beginRequest()
           try {
             await sequenceApi.disconnect()
+            await get().refreshStatus()
+          } catch (error) {
+            setError(error)
+          } finally {
+            finishRequest()
+          }
+        },
+
+        async idle() {
+          beginRequest()
+          try {
+            await sequenceApi.idle()
             await get().refreshStatus()
           } catch (error) {
             setError(error)

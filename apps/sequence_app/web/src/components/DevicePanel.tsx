@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { FiGlobe, FiLogIn, FiLogOut } from 'react-icons/fi'
+import { FiGlobe, FiLogIn, FiLogOut, FiPause } from 'react-icons/fi'
 
 import { t } from '../i18n'
 import { useSequenceStore } from '../store/sequenceStore'
@@ -22,6 +22,7 @@ export function DevicePanel() {
   const ui = useSequenceStore((state) => state.ui)
   const connect = useSequenceStore((state) => state.connect)
   const disconnect = useSequenceStore((state) => state.disconnect)
+  const idle = useSequenceStore((state) => state.idle)
   const setLanguage = useSequenceStore((state) => state.setLanguage)
   const [address, setAddress] = useState('COM1')
 
@@ -87,6 +88,16 @@ export function DevicePanel() {
             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-cyan-500 text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
           >
             <FiLogIn className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => void idle()}
+            disabled={isLoading || !isConnected}
+            title={t(language, 'idle')}
+            aria-label={t(language, 'idle')}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-200 transition hover:border-slate-500 hover:bg-slate-900 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+          >
+            <FiPause className="h-4 w-4" />
           </button>
           <button
             type="button"
