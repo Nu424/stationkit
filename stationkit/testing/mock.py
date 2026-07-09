@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
-import asyncio
-import random
 from typing import Any
 
 from stationkit.core import StationControllerBase
+
+# 稼働していないときの流路（idle 時の disposition）を表すデモ用ラベル。
+_IDLE_ROUTING = "exhaust"
 
 
 class MockStationController(StationControllerBase):
     """実装置なしでフレームワークの動作を確認するモック。
 
     接続・切替・実行の呼び出しをログに残し、状態はメモリ上のみで保持する。
+
+    ガスバッグ採取のような装置を模して、``routing`` に「現在どのレーンへ流して
+    いるか」を持つ。execute 中は対象ターゲットへ、それ以外（idle）のときは排気
+    レーン（``exhaust``）へ向ける様子を ``_do_idle`` で再現する。
     """
 
     def __init__(self) -> None:
         """モックの内部状態を初期化する。"""
         super().__init__()
         self._current_target: int | None = None
+        self._routing: str = _IDLE_ROUTING
         self._call_log: list[str] = []
 
     @property
@@ -54,22 +60,33 @@ class MockStationController(StationControllerBase):
     async def _do_execute(self) -> dict[str, Any]:
         """ダミー結果を返しログに記録する。
 
+        採取中は流路を現在ターゲットへ向ける。execute 成功後は基底クラスが
+        ``_do_idle`` を呼ぶため、流路は自動的に排気レーンへ戻る。
+
         Returns:
             ``mock`` フラグと現在ターゲットを含む dict。
         """
         self._call_log.append("execute()")
-        await asyncio.sleep(random.randint(1, 10))
-        self._call_log.append("execute() completed")
+        self._routing = f"target:{self._current_target}"
 
         return {"mock": True, "target": self._current_target}
+
+    async def _do_idle(self) -> None:
+        """稼働していないときは流路を排気レーンへ向ける。
+
+        接続直後・execute 終端・切断直前に基底クラスから自動的に呼ばれる。
+        """
+        self._call_log.append("idle()")
+        self._routing = _IDLE_ROUTING
 
     async def _do_status(self) -> dict[str, Any]:
         """モック固有の状態を返す。
 
         Returns:
-            現在ターゲットと呼び出しログを含む dict。
+            現在ターゲット・流路・呼び出しログを含む dict。
         """
         return {
             "current_target": self._current_target,
+            "routing": self._routing,
             "call_log": self.call_log,
         }

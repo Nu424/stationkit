@@ -224,11 +224,17 @@ def test_sync_controller_flow() -> None:
     assert result == {"mock": True, "target": 4}
     assert status["controller_state"] == "CONNECTED"
     assert status["current_target"] == 4
+    # execute 成功後は基底クラスが _do_idle を呼び、流路が排気へ戻る。
+    assert status["routing"] == "exhaust"
     assert controller.state == ControllerState.DISCONNECTED
+    # idle は connect 直後 / execute 成功終端 / disconnect 直前に自動発火する。
     assert controller.call_log == [
         "connect(COM3)",
+        "idle()",
         "change(4)",
         "execute()",
+        "idle()",
+        "idle()",
         "disconnect()",
     ]
 
@@ -270,6 +276,86 @@ def test_execute_supports_required_and_optional_params() -> None:
         "target": 7,
         "params": {"duration_s": 3, "rpm": None},
     }
+
+
+# -----------------------------------------------------------------------------
+# idle（稼働していないときの動作）フック
+# -----------------------------------------------------------------------------
+
+
+def test_idle_fires_on_connect_execute_and_disconnect() -> None:
+    """connect 直後 / execute 成功終端 / disconnect 直前に idle が自動発火すること。"""
+    controller = MockStationController()
+
+    controller.connect("COM3")
+    # connect 直後に idle が確立され、流路は排気レーンへ向く。
+    assert controller.status()["routing"] == "exhaust"
+
+    controller.change(2)
+    result = controller.execute()
+    assert result == {"mock": True, "target": 2}
+    # execute 成功後は基底クラスが idle を呼び、流路が排気へ戻る。
+    assert controller.status()["routing"] == "exhaust"
+
+    controller.disconnect()
+    assert controller.call_log == [
+        "connect(COM3)",
+        "idle()",
+        "change(2)",
+        "execute()",
+        "idle()",
+        "idle()",
+        "disconnect()",
+    ]
+
+
+def test_idle_not_fired_after_execute_error() -> None:
+    """想定外エラーで ERROR になった execute のあとは idle を呼ばないこと。"""
+    controller = FailingController()
+    controller.connect("COM3")
+    controller.change(2)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        controller.execute()
+
+    assert controller.state == ControllerState.ERROR
+    # idle は connect 直後の 1 回だけで、execute エラー後には発火しない。
+    assert controller.call_log.count("idle()") == 1
+    assert controller.call_log[-1] != "idle()"
+
+
+def test_idle_fires_after_execution_cancel() -> None:
+    """cancel 終端後も idle が発火し、CONNECTED へ戻ること。"""
+    controller = CancellableExecuteController()
+    controller.connect("COM3")
+    controller.change(5)
+    manager = ExecutionManager(controller)
+    handle = manager.start()
+    assert controller.started.wait(timeout=1.0)
+
+    manager.cancel(handle.execution_id)
+    status = _wait_for_manager_terminal_status(manager, handle.execution_id)
+
+    assert status.state == ExecutionState.CANCELLED
+    assert controller.state == ControllerState.CONNECTED
+    # cancel 後も idle が確立され、流路は排気へ戻る。
+    assert controller.status()["routing"] == "exhaust"
+    # connect 直後と cancel 終端の少なくとも 2 回 idle が発火している。
+    assert controller.call_log.count("idle()") >= 2
+
+
+def test_manual_idle_requires_connected_state() -> None:
+    """手動 idle は CONNECTED のときだけ許可されること。"""
+    controller = MockStationController()
+
+    with pytest.raises(StateError, match="idle requires CONNECTED"):
+        controller.idle()
+
+    controller.connect("COM3")
+    controller.change(1)
+    controller.idle()
+    assert controller.state == ControllerState.CONNECTED
+    assert controller.status()["routing"] == "exhaust"
 
 
 def test_sync_api_rejects_active_event_loop() -> None:
@@ -376,6 +462,22 @@ def test_http_adapter_exposes_core_and_custom_actions() -> None:
     assert execute.json() == {"mock": True, "target": 2}
     assert action.json() == {"status": "success", "level": 7}
     assert status.json()["controller_state"] == "CONNECTED"
+
+
+def test_http_adapter_exposes_idle() -> None:
+    """HTTP の POST /idle で idle 状態へ移せ、未接続では 409 になること。"""
+    controller = MockStationController()
+    client = TestClient(create_http_app(controller))
+
+    client.post("/connect", json={"address": "COM3"})
+    client.post("/change", json={"target": 3})
+
+    assert client.post("/idle").json() == {"ok": True}
+    assert client.get("/status").json()["routing"] == "exhaust"
+
+    client.post("/disconnect")
+    unconnected_idle = client.post("/idle")
+    assert unconnected_idle.status_code == 409
 
 
 def test_http_adapter_supports_required_and_optional_execute_params() -> None:
@@ -488,10 +590,13 @@ def test_gui_handlers_share_controller_state_and_refresh_status() -> None:
     assert execute_message == "Execution completed."
     assert execute_result == {"mock": True, "target": 3}
     assert execute_status["controller_state"] == "CONNECTED"
+    # connect / execute 成功後に idle が自動発火する。
     assert controller.call_log == [
         "connect(COM7)",
+        "idle()",
         "change(3)",
         "execute()",
+        "idle()",
     ]
 
 

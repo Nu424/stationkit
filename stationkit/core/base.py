@@ -19,7 +19,7 @@ from stationkit._logging import (
     log_operation_success,
 )
 from stationkit.core.action import CustomAction
-from stationkit.core.exceptions import StateError
+from stationkit.core.exceptions import ExecutionCancelledError, StateError
 from stationkit.core.introspection import normalize_execute_params
 from stationkit.core.state import ControllerState
 
@@ -95,6 +95,27 @@ class StationControllerBase(ABC):
             ``controller_state`` 以外のキーを含めてよいステータス辞書。
         """
 
+    async def _do_idle(self) -> None:
+        """稼働していないときの装置の disposition を確立する（実装者用・任意）。
+
+        execute を実行していない期間に、装置を安全・既定の状態へ置くための
+        フック。例: ガスバッグ採取装置で、採取していないときは流路を排気
+        レーンへ向ける。
+
+        デフォルトは何もしない。装置がこの振る舞いを持つ場合のみ override する。
+        基底クラスは次の遷移で本フックを自動的に呼ぶ:
+
+        - ``connect`` 成功後（安全な初期状態を確立する）
+        - ``execute`` 成功終端（メイン操作のあと idle 状態へ戻す）
+        - ``execute`` cancel 終端（``ExecutionCancelledError`` による中断後）
+        - ``disconnect`` 直前（通信を閉じる前にハードウェアを安全側へ置く）
+
+        Note:
+            想定外エラーで ``ERROR`` になった execute のあとは呼ばれない
+            （装置状態が不確かなため能動的な操作を避ける）。
+        """
+        return None
+
     # -------------------------------------------------------------------------
     # 公開 API（async）
     # -------------------------------------------------------------------------
@@ -115,6 +136,9 @@ class StationControllerBase(ABC):
                 )
             await self._do_connect(address)
             self._state = ControllerState.CONNECTED
+            # 接続直後に安全な idle 状態を確立する。ここで失敗した場合は、
+            # 接続済みだが idle 未確立であることを呼び出し側へ伝えるため送出する。
+            await self._do_idle()
 
         await self._run_logged_operation(
             "connect",
@@ -131,6 +155,11 @@ class StationControllerBase(ABC):
         async def operation() -> None:
             if self._state == ControllerState.DISCONNECTED:
                 raise StateError("Already disconnected")
+            # 通信を閉じる前にハードウェアを安全側へ置く。ただし CONNECTED 以外
+            # （BUSY / ERROR）では装置状態が不確かなため idle をスキップし、
+            # 切断そのものは必ず継続できるよう idle 失敗も握りつぶす。
+            if self._state == ControllerState.CONNECTED:
+                await self._safe_idle()
             await self._do_disconnect()
             self._state = ControllerState.DISCONNECTED
 
@@ -185,10 +214,26 @@ class StationControllerBase(ABC):
                     result = await self._do_execute()
                 else:
                     result = await self._do_execute(normalized_params)
+            except ExecutionCancelledError:
+                # cancel は「稼働終了」の一種なので、CONNECTED へ戻したうえで
+                # idle 状態を確立してから送出する。idle の失敗が cancel の写像
+                # （ExecutionManager 側での CANCELLED 化）を壊さないよう、ここでは
+                # best-effort（失敗してもログのみ）にする。
+                self._state = ControllerState.CONNECTED
+                await self._safe_idle()
+                raise
             except Exception:
+                # 想定外エラーでは装置状態が不確かなため idle を呼ばない。
                 self._state = ControllerState.ERROR
                 raise
             self._state = ControllerState.CONNECTED
+            # 成功終端では idle を確立する。ここで失敗した場合は装置が安全状態に
+            # ない可能性があるため、ERROR へ遷移させたうえで送出する。
+            try:
+                await self._do_idle()
+            except Exception:
+                self._state = ControllerState.ERROR
+                raise
             return result
 
         return await self._run_logged_operation(
@@ -210,6 +255,25 @@ class StationControllerBase(ABC):
             }
 
         return await self._run_logged_operation("status", operation)
+
+    async def idle_async(self) -> None:
+        """非同期で装置を idle 状態（稼働していないときの disposition）へ移す。
+
+        操作者が任意のタイミングで安全・既定の状態へ戻すための公開 API。
+        通常のライフサイクル（connect / execute / disconnect）では基底クラスが
+        自動的に idle を確立するため、本 API は手動での明示操作向け。
+
+        Raises:
+            StateError: ``CONNECTED`` 以外の場合（実行中や未接続では呼べない）。
+        """
+        async def operation() -> None:
+            if self._state != ControllerState.CONNECTED:
+                raise StateError(
+                    f"idle requires CONNECTED state, current: {self._state.name}"
+                )
+            await self._do_idle()
+
+        await self._run_logged_operation("idle", operation)
 
     # -------------------------------------------------------------------------
     # 公開 API（同期ラッパー）
@@ -270,6 +334,15 @@ class StationControllerBase(ABC):
         """
         return self._run_sync(self.status_async())
 
+    def idle(self) -> None:
+        """同期で装置を idle 状態へ移す。
+
+        Raises:
+            RuntimeError: イベントループ内から呼ばれた場合。
+            StateError: ``CONNECTED`` 以外の場合。
+        """
+        self._run_sync(self.idle_async())
+
     # -------------------------------------------------------------------------
     # 拡張: 固有操作
     # -------------------------------------------------------------------------
@@ -297,6 +370,29 @@ class StationControllerBase(ABC):
         if self._state not in (ControllerState.CONNECTED, ControllerState.BUSY):
             raise StateError(
                 f"Operation requires CONNECTED state, current: {self._state.name}"
+            )
+
+    async def _safe_idle(self) -> None:
+        """``_do_idle`` を best-effort で実行し、失敗しても送出しない。
+
+        cancel 後や disconnect 直前のように「別の結果（cancel の写像や切断）を
+        優先したい」経路で使う。idle の失敗は装置が安全状態でない可能性を示す
+        ため、握りつぶさずログには残す。
+
+        Returns:
+            なし。
+        """
+        try:
+            await self._do_idle()
+        except Exception as exc:
+            log_operation_failure(
+                self._logger,
+                layer="controller",
+                operation_name="idle",
+                controller_name=type(self).__name__,
+                duration_ms=0.0,
+                context={"best_effort": True, "state_after": self._state.name},
+                exc=exc,
             )
 
     async def _run_logged_operation(
