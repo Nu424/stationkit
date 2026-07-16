@@ -60,6 +60,10 @@ export const sequenceApi = {
     return post<{ ok: boolean }>('/api/controller/disconnect')
   },
 
+  idle(): Promise<{ ok: boolean }> {
+    return post<{ ok: boolean }>('/api/controller/idle')
+  },
+
   change(target: unknown): Promise<{ ok: boolean }> {
     return post<{ ok: boolean }>('/api/controller/change', { target })
   },

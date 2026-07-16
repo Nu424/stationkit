@@ -97,6 +97,19 @@ def create_http_app(
         )
         return {"ok": True}
 
+    @app.post("/idle")
+    async def idle() -> dict[str, bool]:
+        """装置を idle 状態（稼働していないときの disposition）へ移す。"""
+        await _run_http_operation(
+            logger=app_logger,
+            controller=controller,
+            operation_name="idle",
+            operation=controller.idle_async,
+            context={"path": "/idle"},
+            execution_manager=execution_manager,
+        )
+        return {"ok": True}
+
     @app.get("/status")
     async def status() -> dict[str, Any]:
         """コントローラおよび装置の状態を取得する。"""

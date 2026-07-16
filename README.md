@@ -28,6 +28,7 @@
 - [スクリプトから直接使う](#スクリプトから直接使う)
 - [execute にパラメータを持たせる](#execute-にパラメータを持たせる)
 - [実行コンテキスト（ExecutionContext）](#実行コンテキストexecutioncontext)
+- [稼働していないときの動作（idle）](#稼働していないときの動作idle)
 - [固有操作（CustomAction）](#固有操作customaction)
 - [長時間 execute を別層で扱う（ExecutionManager）](#長時間-execute-を別層で扱うexecutionmanager)
 - [HTTP サーバーとして動かす](#http-サーバーとして動かす)
@@ -103,6 +104,8 @@ React frontend の build 済み静的ファイルも同梱されるため、`fro
 5. 装置固有の操作を追加したい場合は `get_custom_actions()` で `CustomAction` のリストを返す。
 6. 実行中の安全な中断に対応したい場合は、同期メソッド `cancel_execution()` を任意実装する。
    中断された `_do_execute` は `ExecutionCancelledError` を送出する運用を推奨します。
+7. **稼働していないときの動作**（idle 時の disposition）を定義したい場合は、async メソッド `_do_idle()` を任意実装する。
+   接続直後・execute 終端・切断直前に基底クラスが自動的に呼び出します（[稼働していないときの動作（idle）](#稼働していないときの動作idle) を参照）。
 
 同期版 (`connect` 等) および `*_async` 版は基底クラスが提供するため、サブクラス側で二重実装する必要はありません。
 `_do_execute` の中身が同期的に長時間かかる処理でも問題ありません。HTTP / GUI / service-backed CLI のようにブロッキングを避けたい面では、後述の `ExecutionManager` が `controller.execute()` 全体を別スレッドで管理します。
@@ -163,6 +166,13 @@ class MyDeviceController(StationControllerBase):
 
     async def _do_status(self) -> dict[str, Any]:
         return {"target": self._target}
+
+    # 稼働していないときの動作を定義する場合（任意）:
+    # 接続直後 / execute 終端 / 切断直前に基底クラスが自動的に呼ぶ。
+    # 例: ガスバッグ採取装置で、採取していないときは流路を排気レーンへ向ける。
+    async def _do_idle(self) -> None:
+        # 例: await self._route_to_exhaust()
+        ...
 
     # カスタムアクションを実装する場合:
     # Pydantic モデルで入出力を定義し、CustomAction として公開する。
@@ -347,6 +357,47 @@ class TimedHoldController(StationControllerBase):
 - `context` は HTTP / CLI / GUI のユーザー入力 schema には現れません。
 - params と併用する場合は `_do_execute(self, params: MyParams, *, context: ExecutionContext)` とします。
 - `context` に含まれる時刻は UTC です。必要に応じて `datetime.astimezone()` でローカルタイムに変換してください。
+## 稼働していないときの動作（idle）
+
+execute を実行していない期間に、装置を安全・既定の状態へ置きたい場合は、async メソッド `_do_idle()` を実装します。
+たとえばガスバッグ採取装置では、**採取中（execute）は流路をバッグへ、採取していないとき（idle）は排気レーンへ** 向けたい、といったケースに対応できます。
+
+`_do_idle()` は基底クラスが次の遷移で **自動的に** 呼び出します。実装者は 1 度書けば、ライブラリ / HTTP / CLI / GUI / Sequence のどの経路でも一貫して効きます。
+
+- `connect` 成功後（接続直後に安全な初期状態を確立する）
+- `execute` 成功終端（メイン操作のあと idle 状態へ戻す）
+- `execute` cancel 終端（`ExecutionCancelledError` による協調的中断のあと）
+- `disconnect` 直前（通信を閉じる前にハードウェアを安全側へ置く。ただし `CONNECTED` のときのみ）
+
+```python
+from typing import Any
+
+from stationkit import StationControllerBase
+
+
+class GasBagController(StationControllerBase):
+    # _do_connect / _do_disconnect / _do_status は省略
+
+    async def _do_change(self, target: int) -> None:
+        # どのバッグを採取対象にするかを記録するだけ（この時点では流路を動かさない）
+        self._target = target
+
+    async def _do_execute(self) -> dict[str, Any]:
+        await self._route_to_bag(self._target)  # 採取中はバッグへ
+        result = await self._collect()
+        return result
+        # execute 終端で基底クラスが _do_idle() を呼ぶため、流路は自動で排気へ戻る
+
+    async def _do_idle(self) -> None:
+        await self._route_to_exhaust()  # 稼働していないときは排気レーンへ
+```
+
+**設計上の要点:**
+
+- idle は新しい状態ではなく「`CONNECTED` に入るときに確立する振る舞い」です。`ControllerState` は変わりません。
+- **想定外エラーで `ERROR` になった execute のあとは呼ばれません**（装置状態が不確かなため、能動的な流路操作を避ける方針）。
+- 時間駆動シーケンス（`TIME_DRIVEN`）の待機ギャップ中は、直前ステップの execute 終端で idle が確立されるため、**追加のステップ無しで自動的に排気状態**になります。
+- 操作者が任意のタイミングで idle 状態へ戻したい場合は、公開 API `idle()` / `idle_async()`（および HTTP `POST /idle`、CLI `idle`、GUI「Go Idle」、Sequence App の待機ボタン）を使えます。`idle()` は `CONNECTED` のときのみ許可され、実行中や未接続では `StateError` になります。
 
 ## 固有操作（CustomAction）
 
@@ -447,6 +498,7 @@ uv run uvicorn mymodule:app --reload
 |----------|------|------|----------------------|--------------|
 | POST | `/connect` | 装置に接続する | `{"address": "<接続先>"}` 例: `{"address": "COM3"}` | `{"ok": true}` |
 | POST | `/disconnect` | 装置から切断する | なし（空ボディ） | `{"ok": true}` |
+| POST | `/idle` | 装置を idle 状態（稼働していないときの disposition）へ移す（要接続） | なし（空ボディ） | `{"ok": true}` |
 | GET | `/status` | コントローラ状態と装置固有ステータスを取得 | なし | `{"controller_state": "CONNECTED", ...}` （`...` は `_do_status()` のキー） |
 | POST | `/change` | 対象ステーション / チャネルを切り替える（要接続） | `{"target": <値>}` 型は `_do_change` の型ヒントに従う（整数なら `{"target": 2}`） | `{"ok": true}` |
 | POST | `/execute` | メイン操作を実行して結果を返す（要接続） | 既定は空ボディ。`_do_execute(params: ExecuteParams)` を定義している場合はそのスキーマに従う JSON。`ExecuteParams \| None = None` なら空ボディ可 | 装置の戻り値依存の JSON（例: `{"mock": true, "target": 2}`） |
@@ -504,6 +556,7 @@ uv run python mycli.py --server http://127.0.0.1:8000 execute-status
 uv run python mycli.py --server http://127.0.0.1:8000 execute-cancel
 uv run python mycli.py --server http://127.0.0.1:8000 execute
 uv run python mycli.py --server http://127.0.0.1:8000 execute '{"duration_s": 5, "rpm": 120}'
+uv run python mycli.py --server http://127.0.0.1:8000 idle
 uv run python mycli.py --server http://127.0.0.1:8000 status
 uv run python mycli.py --server http://127.0.0.1:8000 disconnect
 ```
@@ -583,6 +636,7 @@ app.launch()
 - `Start Execute` は内部で `ExecutionManager` を使って **非ブロッキングに開始** します。ハンドラ自体は完了まで待ちません。
 - `Refresh Status` で実行状況を更新し、完了済み execute の結果は Result パネルに反映されます。
 - `Cancel Execute` で協調的 cancel を要求できます。
+- `Go Idle` で装置を idle 状態（稼働していないときの disposition）へ手動で移せます（`CONNECTED` のときのみ）。
 - Status パネルには controller / device のステータスに加え、取得可能な場合は `execution` キーでジョブ状態も表示されます。
 
 GUI からの操作は共有 controller に対して逐次実行され、各操作のあとに最新の `status()` 相当の情報が画面へ再反映されます。

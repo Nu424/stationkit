@@ -228,6 +228,27 @@ class StationControllerBase(ABC):
 
 この構成により、単純な Python 利用者は従来どおり `execute()` / `execute_async()` を使い続けられ、長時間 execute による UI / HTTP ブロッキングだけを別層で吸収できる。
 
+### 3.3.2 稼働していないときの動作: `_do_idle()`
+
+「稼働していないとき（execute を実行していない期間）の装置の disposition」を宣言するための **任意フック**。
+たとえばガスバッグ採取装置で、採取中は流路をバッグへ、採取していないときは排気レーンへ向ける、といった要件に対応する。
+
+- 具体クラスは async メソッド `_do_idle()` を任意実装する（非 abstract・デフォルト no-op）。
+- 基底クラスが次の遷移で **自動的に** 呼び出す:
+  - `connect` 成功後（安全な初期状態の確立）
+  - `execute` 成功終端（メイン操作後に idle へ戻す）
+  - `execute` cancel 終端（`ExecutionCancelledError` による協調的中断後。基底の `execute_async` 内で捕捉→`CONNECTED` 復帰→idle→再送出とし、`ExecutionManager` は無改修）
+  - `disconnect` 直前（通信を閉じる前にハードウェアを安全側へ置く。`CONNECTED` のときのみ）
+- **想定外エラーで `ERROR` になった execute のあとは呼ばない**（装置状態が不確かなため能動操作を避ける）。
+- idle は新しい状態ではなく「`CONNECTED` に入るときに確立する振る舞い」であり、`ControllerState` は変えない。
+- 操作者向けに手動 API `idle()` / `idle_async()` を公開する（`CONNECTED` のときのみ許可）。HTTP `POST /idle`、CLI `idle`、GUI「Go Idle」、Sequence App の待機ボタンから利用できる。
+- 時間駆動シーケンスの待機ギャップ中は、直前ステップの execute 終端で idle が確立されるため、`sequence.py` は無改修で「待機中は排気」を満たせる。
+
+失敗時の扱い:
+
+- `connect` 直後 / `execute` 成功終端の idle 失敗は送出する（後者は `ERROR` へ遷移させる。装置が安全状態にない可能性を通知するため）。
+- `execute` cancel 終端 / `disconnect` 直前の idle 失敗は **best-effort**（ログのみ）とし、cancel の写像や切断そのものを妨げない。
+
 ### 3.4 固有機能定義: `CustomAction`
 
 フレームワーク非依存の純粋なデータクラス。
@@ -549,6 +570,7 @@ async def main():
 ### 今後の拡張候補
 
 - **イベント / フック機構**: `on_connect`, `on_execute_complete` 等のコールバック
+  （「稼働していないときの動作」は `_do_idle()`（3.3.2）として実装済み）
 - **バッチ実行**: 複数ステーションへの連続操作を宣言的に記述する機能
 - **GUI アダプタ**: `create_gui_app()` の実装（Tkinter / web UI 等）
 - **ロギング**: 基底クラスの公開APIに統一的なログ出力を組み込む

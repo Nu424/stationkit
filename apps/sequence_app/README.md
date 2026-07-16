@@ -69,6 +69,7 @@ static 配信が不要なら、library 側の `create_sequence_http_app(controll
 ## 手動確認チェックリスト
 
 - connect → add step → validate → run → stop
+- connect 後に「待機状態へ（Go Idle）」ボタンで idle へ移せること（status の `routing` が更新される）
 - time-driven step の start/end 表示と countdown 表示
 - import/export roundtrip
 - single-step check の load / start
