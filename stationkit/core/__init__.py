@@ -10,6 +10,7 @@ from stationkit.core.exceptions import (
     StationError,
     TimeoutError,
 )
+from stationkit.core.execution_context import ExecutionContext
 from stationkit.core.state import ControllerState
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "ControllerState",
     "CustomAction",
     "ExecutionCancelledError",
+    "ExecutionContext",
     "StateError",
     "StationControllerBase",
     "StationError",

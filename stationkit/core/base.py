@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from time import perf_counter
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from stationkit._logging import (
@@ -20,7 +21,11 @@ from stationkit._logging import (
 )
 from stationkit.core.action import CustomAction
 from stationkit.core.exceptions import StateError
-from stationkit.core.introspection import normalize_execute_params
+from stationkit.core.execution_context import ExecutionContext
+from stationkit.core.introspection import (
+    normalize_execute_params,
+    resolve_execute_params_spec,
+)
 from stationkit.core.state import ControllerState
 
 
@@ -82,6 +87,12 @@ class StationControllerBase(ABC):
         ``_do_execute(self, params: MyParams)`` または
         ``_do_execute(self, params: MyParams | None = None)`` のように
         Pydantic モデル 1 個を追加で受け取れる。
+
+        実行コンテキストが必要な場合は、予約済み keyword-only 引数として
+        ``*, context: ExecutionContext`` を追加できる。例:
+
+        - ``_do_execute(self, *, context: ExecutionContext)``
+        - ``_do_execute(self, params: MyParams, *, context: ExecutionContext)``
 
         Returns:
             装置から得た結果。dict や Pydantic モデルなど任意。
@@ -155,7 +166,12 @@ class StationControllerBase(ABC):
             log_context={"target_type": type(target).__name__},
         )
 
-    async def execute_async(self, params: Any | None = None) -> Any:
+    async def execute_async(
+        self,
+        params: Any | None = None,
+        *,
+        context: ExecutionContext | None = None,
+    ) -> Any:
         """非同期でメイン操作を実行する。
 
         実行中は状態が ``BUSY`` になり、成功時は ``CONNECTED`` に戻る。
@@ -165,6 +181,8 @@ class StationControllerBase(ABC):
             params: execute 入力。Pydantic モデルインスタンス、または
                 ``dict`` などモデルに変換できる値を渡す。``_do_execute`` が
                 引数を持たない場合は ``None`` を渡すか省略する。
+            context: 実行コンテキスト。省略時は実開始時刻だけを持つ既定値を生成する。
+                ``_do_execute`` が ``context`` を受け取る場合のみ渡される。
 
         Returns:
             ``_do_execute`` の戻り値。
@@ -175,16 +193,25 @@ class StationControllerBase(ABC):
         """
         # ---引数として渡されたパラメータを、Pydanticモデルに変換する
         normalized_params = normalize_execute_params(self, params)
+        accepts_context = resolve_execute_params_spec(self).accepts_context
+        resolved_context = context or ExecutionContext(started_at=_utcnow())
 
         async def operation() -> Any:
             self._require_connected()
             self._state = ControllerState.BUSY
             try:
                 # ---引数をつけたりつけなかったりしながら、_do_execute()を実行する
-                if normalized_params is None:
+                if normalized_params is None and not accepts_context:
                     result = await self._do_execute()
-                else:
+                elif normalized_params is None:
+                    result = await self._do_execute(context=resolved_context)
+                elif not accepts_context:
                     result = await self._do_execute(normalized_params)
+                else:
+                    result = await self._do_execute(
+                        normalized_params,
+                        context=resolved_context,
+                    )
             except Exception:
                 self._state = ControllerState.ERROR
                 raise
@@ -194,7 +221,10 @@ class StationControllerBase(ABC):
         return await self._run_logged_operation(
             "execute",
             operation,
-            log_context={"has_params": normalized_params is not None},
+            log_context={
+                "has_params": normalized_params is not None,
+                "has_context": accepts_context,
+            },
         )
 
     async def status_async(self) -> dict[str, Any]:
@@ -245,11 +275,17 @@ class StationControllerBase(ABC):
         """
         self._run_sync(self.change_async(target))
 
-    def execute(self, params: Any | None = None) -> Any:
+    def execute(
+        self,
+        params: Any | None = None,
+        *,
+        context: ExecutionContext | None = None,
+    ) -> Any:
         """同期でメイン操作を実行する。
 
         Args:
             params: ``execute_async`` と同じ execute 入力。
+            context: ``execute_async`` と同じ実行コンテキスト。
 
         Returns:
             ``_do_execute`` の戻り値。
@@ -257,7 +293,7 @@ class StationControllerBase(ABC):
         Raises:
             RuntimeError: イベントループ内から呼ばれた場合。
         """
-        return self._run_sync(self.execute_async(params))
+        return self._run_sync(self.execute_async(params, context=context))
 
     def status(self) -> dict[str, Any]:
         """同期で状態を取得する。
@@ -386,3 +422,12 @@ class StationControllerBase(ABC):
             "sync API cannot be called from inside an event loop. "
             "Use the corresponding *_async() method instead."
         )
+
+
+def _utcnow() -> datetime:
+    """UTC の現在時刻を返す。
+
+    Returns:
+        タイムゾーン付きの UTC 現在時刻。
+    """
+    return datetime.now(timezone.utc)

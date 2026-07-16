@@ -30,6 +30,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from stationkit.core import StateError, StationControllerBase, TimeoutError
+from stationkit.core.execution_context import ExecutionContext
 from stationkit.core.introspection import (
     normalize_execute_params,
     resolve_execute_params_spec,
@@ -805,8 +806,31 @@ class SequenceRunner:
         # ----------
         # ---targetを変更する
         self._controller.change(self._target_adapter.validate_python(step.target))
+        # ---execute に渡す実行コンテキストを組み立てる
+        # TIME_DRIVEN の予定境界は書き換えず、実開始時刻との差から遅延を判別可能にする。
+        scheduled_start_at = (
+            _to_utc(step.start_at)
+            if mode == SequenceMode.TIME_DRIVEN and step.start_at is not None
+            else None
+        )
+        scheduled_end_at = (
+            _to_utc(step.end_at)
+            if mode == SequenceMode.TIME_DRIVEN and step.end_at is not None
+            else None
+        )
+        step_context = ExecutionContext(
+            started_at=_utcnow(),
+            scheduled_start_at=scheduled_start_at,
+            scheduled_end_at=scheduled_end_at,
+            sequence_run_id=run_id,
+            sequence_step_id=step.id,
+            sequence_step_index=index,
+        )
         # ---executeを開始する
-        handle = self._execution_manager.start(step.execute_params)
+        handle = self._execution_manager.start(
+            step.execute_params,
+            context=step_context,
+        )
         # ---_SequenceRecordを更新する
         with self._lock:
             record = self._require_matching_record_locked(run_id)
@@ -817,7 +841,7 @@ class SequenceRunner:
             runtime.message = "Execution running."
 
         # ---executeの終端までポーリングする(scheduled_endがあるなら、それも考慮する)
-        scheduled_end = _to_utc(step.end_at) if mode == SequenceMode.TIME_DRIVEN and step.end_at is not None else None
+        scheduled_end = scheduled_end_at
         return self._wait_for_execution(run_id, index, handle.execution_id, scheduled_end)
 
     def _wait_until_start(

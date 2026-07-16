@@ -27,6 +27,7 @@
 - [同期 API と非同期 API](#同期-api-と非同期-api)
 - [スクリプトから直接使う](#スクリプトから直接使う)
 - [execute にパラメータを持たせる](#execute-にパラメータを持たせる)
+- [実行コンテキスト（ExecutionContext）](#実行コンテキストexecutioncontext)
 - [固有操作（CustomAction）](#固有操作customaction)
 - [長時間 execute を別層で扱う（ExecutionManager）](#長時間-execute-を別層で扱うexecutionmanager)
 - [HTTP サーバーとして動かす](#http-サーバーとして動かす)
@@ -97,6 +98,8 @@ React frontend の build 済み静的ファイルも同梱されるため、`fro
 4. `_do_execute` に実行時パラメータが必要なら **Pydantic モデル 1 個**を追加する。
    `_do_execute(self, params: MyParams)` または
    `_do_execute(self, params: MyParams | None = None)` の 2 形式に対応します。
+   シーケンス予定時刻などが必要なら、予約済み keyword-only 引数
+   `*, context: ExecutionContext` を追加できます（[実行コンテキスト](#実行コンテキストexecutioncontext)）。
 5. 装置固有の操作を追加したい場合は `get_custom_actions()` で `CustomAction` のリストを返す。
 6. 実行中の安全な中断に対応したい場合は、同期メソッド `cancel_execution()` を任意実装する。
    中断された `_do_execute` は `ExecutionCancelledError` を送出する運用を推奨します。
@@ -284,6 +287,66 @@ class MyDeviceController(StationControllerBase):
 - **GUI**: モデルのフィールドが単純型ならフォーム、複雑型なら JSON テキスト入力
 
 `_do_execute(self, params: ExecuteParams | None = None)` のように `None` を許容した場合は、引数なしの `execute()` もそのまま使えます。
+
+## 実行コンテキスト（ExecutionContext）
+
+シーケンス実行時の開始・終了予定時刻など、**ユーザー入力ではない実行メタデータ** は
+`ExecutionContext` として controller に渡せます。これは `execute_params` とは別物です。
+
+`_do_execute` に予約済み keyword-only 引数 `context: ExecutionContext` を追加すると opt-in できます。
+既存の無引数 / params 付き `_do_execute` はそのまま動作します。
+
+```python
+import asyncio
+from datetime import datetime, timezone
+from typing import Any
+
+from stationkit import ExecutionCancelledError, ExecutionContext, StationControllerBase
+
+
+class TimedHoldController(StationControllerBase):
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel_requested = False
+
+    def cancel_execution(self) -> None:
+        self._cancel_requested = True
+
+    async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
+        # TIME_DRIVEN では scheduled_end_at が Sequence 行の end_at（UTC）になる。
+        # COMPLETION_DRIVEN / 直接 execute / check-step では None。
+        deadline = context.scheduled_end_at
+        self._cancel_requested = False
+        while deadline is None or datetime.now(timezone.utc) < deadline:
+            if self._cancel_requested:
+                raise ExecutionCancelledError("Hold cancelled.")
+            await asyncio.sleep(0.1)
+            if deadline is None:
+                break
+        return {
+            "execution_id": context.execution_id,
+            "started_at": context.started_at.isoformat(),
+            "scheduled_end_at": None
+            if deadline is None
+            else deadline.isoformat(),
+        }
+```
+
+主なフィールド:
+
+| フィールド | 意味 |
+|------------|------|
+| `started_at` | 実際の execute 開始時刻 |
+| `scheduled_start_at` / `scheduled_end_at` | Sequence の予定境界（`TIME_DRIVEN` 以外は `None`） |
+| `execution_id` | `ExecutionManager` のジョブ ID（直接 `execute()` では `None`） |
+| `sequence_run_id` / `sequence_step_id` / `sequence_step_index` | Sequence 追跡用（シーケンス外は `None`） |
+
+注意:
+
+- `finished_at` は実行開始時には未確定のため context には含めません（`ExecutionStatus.finished_at` 側）。
+- `context` は HTTP / CLI / GUI のユーザー入力 schema には現れません。
+- params と併用する場合は `_do_execute(self, params: MyParams, *, context: ExecutionContext)` とします。
+- `context` に含まれる時刻は UTC です。必要に応じて `datetime.astimezone()` でローカルタイムに変換してください。
 
 ## 固有操作（CustomAction）
 

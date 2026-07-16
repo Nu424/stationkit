@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from stationkit import (
     ExecutionCancelledError,
+    ExecutionContext,
     SequenceMode,
     create_sequence_http_app,
 )
@@ -93,6 +94,53 @@ class CancellableExecuteController(SlowExecuteController):
 
     async def _do_execute(self) -> dict[str, Any]:
         self._call_log.append("execute()")
+        self.started.set()
+        while not self._release.is_set():
+            await asyncio.sleep(0.01)
+        raise ExecutionCancelledError("Execution cancelled.")
+
+
+class ContextAwareExecuteController(MockStationController):
+    """ExecutionContext を受け取る controller。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self._release = Event()
+        self.last_context: ExecutionContext | None = None
+
+    def finish_execution(self) -> None:
+        """execute を終端へ進める。"""
+        self._release.set()
+
+    async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
+        self.last_context = context
+        self._call_log.append("execute(context)")
+        self.started.set()
+        while not self._release.is_set():
+            await asyncio.sleep(0.01)
+        return {
+            "mock": True,
+            "target": self._current_target,
+            "execution_id": context.execution_id,
+        }
+
+
+class ContextAwareCancellableController(ContextAwareExecuteController):
+    """context 対応かつ cancel 可能な controller。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_calls = 0
+
+    def cancel_execution(self) -> None:
+        """cancel を受けたら execute を終了へ進める。"""
+        self.cancel_calls += 1
+        self.finish_execution()
+
+    async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
+        self.last_context = context
+        self._call_log.append("execute(context)")
         self.started.set()
         while not self._release.is_set():
             await asyncio.sleep(0.01)
@@ -299,3 +347,101 @@ def test_sequence_http_rejects_sequence_run_during_manual_execution() -> None:
         lambda payload: payload["manual_execution"] is not None
         and payload["manual_execution"]["state"] == "SUCCEEDED",
     )
+
+
+def test_sequence_http_meta_does_not_expose_execution_context() -> None:
+    """ExecutionContext は meta のユーザー入力 schema に現れないこと。"""
+    client = TestClient(create_sequence_http_app(ContextAwareExecuteController()))
+
+    meta = client.get("/api/meta")
+
+    assert meta.status_code == 200
+    body = meta.json()
+    assert body["execute"]["kind"] == "none"
+    assert "context" not in body["execute"]
+    assert "fields" not in body["execute"] or all(
+        field["name"] != "context" for field in body["execute"].get("fields", [])
+    )
+
+
+def test_sequence_http_check_step_context_has_no_schedule() -> None:
+    """manual check-step では予定境界が None であること。"""
+    controller = ContextAwareExecuteController()
+    client = TestClient(create_sequence_http_app(controller))
+    client.post("/api/controller/connect", json={"address": "COM55"})
+
+    started = client.post(
+        "/api/sequence/check-step",
+        json={
+            "definition": {
+                "name": "check-context",
+                "steps": [{"label": "only", "target": 8}],
+            },
+            "step_index": 0,
+        },
+    )
+    assert started.status_code == 200
+    assert controller.started.wait(timeout=1.0)
+    assert controller.last_context is not None
+    assert controller.last_context.execution_id == started.json()["execution_id"]
+    assert controller.last_context.scheduled_start_at is None
+    assert controller.last_context.scheduled_end_at is None
+    assert controller.last_context.sequence_run_id is None
+
+    controller.finish_execution()
+    _wait_for_status_condition(
+        client,
+        lambda payload: payload["manual_execution"] is not None
+        and payload["manual_execution"]["state"] == "SUCCEEDED",
+    )
+
+
+def test_sequence_http_time_driven_passes_schedule_in_context() -> None:
+    """TIME_DRIVEN の予定時刻が controller context に届くこと。"""
+    controller = ContextAwareCancellableController()
+    client = TestClient(create_sequence_http_app(controller))
+    client.post("/api/controller/connect", json={"address": "COM56"})
+    now = datetime.now(UTC)
+    start_at = now + timedelta(milliseconds=50)
+    end_at = start_at + timedelta(milliseconds=200)
+    definition = {
+        "name": "timed-context",
+        "mode": SequenceMode.TIME_DRIVEN.value,
+        "steps": [
+            {
+                "id": "step-1",
+                "target": 3,
+                "start_at": start_at.isoformat(),
+                "end_at": end_at.isoformat(),
+            }
+        ],
+    }
+
+    started = client.post("/api/sequence/run", json={"definition": definition})
+    assert started.status_code == 200
+    assert controller.started.wait(timeout=1.5)
+    assert controller.last_context is not None
+    assert controller.last_context.sequence_run_id == started.json()["run_id"]
+    assert controller.last_context.sequence_step_id == "step-1"
+    assert controller.last_context.sequence_step_index == 0
+    assert controller.last_context.scheduled_start_at is not None
+    assert controller.last_context.scheduled_end_at is not None
+    assert abs(
+        (
+            controller.last_context.scheduled_start_at - start_at.astimezone(UTC)
+        ).total_seconds()
+    ) < 0.001
+    assert abs(
+        (
+            controller.last_context.scheduled_end_at - end_at.astimezone(UTC)
+        ).total_seconds()
+    ) < 0.001
+
+    terminal = _wait_for_status_condition(
+        client,
+        lambda payload: payload["sequence"] is not None
+        and payload["sequence"]["state"] != "RUNNING",
+        timeout_s=2.0,
+    )
+    assert terminal["sequence"]["state"] in {"SUCCEEDED", "CANCELLED"}
+    assert controller.cancel_calls >= 1

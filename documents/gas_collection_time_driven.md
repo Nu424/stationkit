@@ -6,23 +6,24 @@
 
 現行の stationkit では、ガス捕集は `execute` の中に「捕集中」という長時間操作として実装するのが最も自然で安全である。
 
-`TIME_DRIVEN` は「`start_at` まで待ち、`change(target)` 後に `execute` を開始し、`end_at` に到達したら `cancel_execution()` を要求する」モードであり、`_do_execute()` に duration や deadline を自動注入する仕組みではない。したがって、`_do_execute()` がバルブを開閉するだけですぐ戻る実装だと、シーケンス runner はそのステップを完了扱いにし、`end_at` まで状態を保持しない。
+`TIME_DRIVEN` は「`start_at` まで待ち、`change(target)` 後に `execute` を開始し、`end_at` に到達したら `cancel_execution()` を要求する」モードである。
 
-## 現行 API での推奨実装
+加えて、controller が `_do_execute(..., *, context: ExecutionContext)` を opt-in している場合、
+Sequence の予定境界は `context.scheduled_start_at` / `context.scheduled_end_at` として渡される。
+したがって、測定時間を `execute_params` に重複して書く必要はない。
 
-ガス捕集を 1 回の長時間 `execute` と見なし、`execute_params` に捕集時間を渡す。
+一方、context 非対応の controller では従来どおり `execute_params.duration_s` を使う。
+
+## 推奨実装（ExecutionContext 利用）
+
+`TIME_DRIVEN` の `end_at` を deadline として使い、到達前に cancel されても安全に閉じる。
 
 ```python
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, Field
-
-from stationkit import ExecutionCancelledError, StationControllerBase
-
-
-class GasCollectionParams(BaseModel):
-    duration_s: float = Field(gt=0)
+from stationkit import ExecutionCancelledError, ExecutionContext, StationControllerBase
 
 
 class GasBagController(StationControllerBase):
@@ -37,7 +38,7 @@ class GasBagController(StationControllerBase):
     def cancel_execution(self) -> None:
         self._cancel_requested = True
 
-    async def _do_execute(self, params: GasCollectionParams) -> dict[str, Any]:
+    async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
         if self._gas_bag is None:
             raise RuntimeError("gas bag is not selected")
 
@@ -47,15 +48,24 @@ class GasBagController(StationControllerBase):
             await self._open_gas_bag_valve(self._gas_bag)
             opened = True
 
-            remaining_s = params.duration_s
-            while remaining_s > 0:
+            # TIME_DRIVEN: scheduled_end_at まで保持（runner が end_at で cancel も要求する）
+            # COMPLETION_DRIVEN / 直接実行: scheduled_end_at は None。必要なら別途 params を使う。
+            deadline = context.scheduled_end_at
+            while deadline is None or datetime.now(timezone.utc) < deadline:
                 if self._cancel_requested:
                     raise ExecutionCancelledError("Gas collection cancelled.")
-                interval_s = min(0.2, remaining_s)
-                await asyncio.sleep(interval_s)
-                remaining_s -= interval_s
+                await asyncio.sleep(0.2)
+                if deadline is None:
+                    # 完了駆動で deadline が無い場合は即座に終えるか、params 併用へ。
+                    break
 
-            return {"gas_bag": self._gas_bag, "duration_s": params.duration_s}
+            return {
+                "gas_bag": self._gas_bag,
+                "started_at": context.started_at.isoformat(),
+                "scheduled_end_at": None
+                if deadline is None
+                else deadline.isoformat(),
+            }
         finally:
             if opened:
                 await self._close_gas_bag_valve(self._gas_bag)
@@ -64,22 +74,49 @@ class GasBagController(StationControllerBase):
 ポイントは次の通り。
 
 - `change(target)` は「どのガスバッグを対象にするか」を選ぶ。
-- `_do_execute(params)` は「バルブを開けて、指定時間または cancel まで捕集し、必ず閉じる」一連の操作を表す。
+- `_do_execute(..., context=...)` は「バルブを開けて、予定終了または cancel まで捕集し、必ず閉じる」一連の操作を表す。
+- `context.scheduled_*` は **予定時刻**。`context.started_at` は **実開始時刻**。遅延開始があっても予定開始は書き換えられない。
 - `finally` でバルブを閉じることで、成功・失敗・cancel のどれでも安全側へ戻す。
 - `cancel_execution()` は同期メソッドとして実装し、`_do_execute()` 側が短い間隔でフラグを確認して `ExecutionCancelledError` を送出する。
 
-この形なら `COMPLETION_DRIVEN` では `duration_s` が終わるまで次ステップに進まず、`TIME_DRIVEN` では `end_at` 到達時の cancel 要求で捕集を終了できる。
+この形なら `TIME_DRIVEN` では Sequence 行の `end_at` をそのまま deadline にでき、
+`execute_params` に測定時間を二重入力する必要がない。
+
+## 互換実装（execute_params.duration_s）
+
+context を使わない既存 controller では、これまでどおり `duration_s` を params に渡す。
+
+```python
+from pydantic import BaseModel, Field
+
+
+class GasCollectionParams(BaseModel):
+    duration_s: float = Field(gt=0)
+
+
+class LegacyGasBagController(StationControllerBase):
+    async def _do_execute(self, params: GasCollectionParams) -> dict[str, Any]:
+        remaining_s = params.duration_s
+        while remaining_s > 0:
+            if self._cancel_requested:
+                raise ExecutionCancelledError("Gas collection cancelled.")
+            interval_s = min(0.2, remaining_s)
+            await asyncio.sleep(interval_s)
+            remaining_s -= interval_s
+        return {"duration_s": params.duration_s}
+```
 
 ## `TIME_DRIVEN` を使う場合の注意
 
-`TIME_DRIVEN` の `start_at` / `end_at` は、操作に渡される「待機時間」ではなく、runner が扱うスケジュール境界である。
+`TIME_DRIVEN` の `start_at` / `end_at` は、runner が扱うスケジュール境界である。
+context 対応 controller では同じ値が `scheduled_start_at` / `scheduled_end_at` としても渡る。
 
 処理の流れは概ね次のようになる。
 
 ```mermaid
 flowchart TD
     waitStart["Wait until start_at"] --> changeTarget["change(target)"]
-    changeTarget --> startExecute["ExecutionManager.start(execute_params)"]
+    changeTarget --> startExecute["ExecutionManager.start(params, context)"]
     startExecute --> pollStatus["Poll execution status"]
     pollStatus -->|"before end_at"| pollStatus
     pollStatus -->|"end_at reached"| requestCancel["cancel_execution()"]
@@ -100,7 +137,9 @@ async def _do_execute(self) -> None:
 
 ## 設計上の判断基準
 
-`duration_s` を `_do_execute()` に渡す方式は、現行フレームワークの範囲では「運用でカバー」ではなく、`execute` を長時間操作として定義する正攻法である。stationkit の `ExecutionManager` も、`controller.execute()` 全体が長時間かかることを前提に、開始・状態取得・協調 cancel を別層で扱う設計になっている。
+- **時間駆動で予定終了まで保持したい**: `ExecutionContext.scheduled_end_at` を使う（推奨）。
+- **完了駆動で相対時間だけ決めたい**: `execute_params.duration_s` を使う。
+- **両方をサポートしたい**: `_do_execute(self, params: Params | None = None, *, context: ExecutionContext)` とし、`scheduled_end_at` があればそれを優先する。
 
 一方で、次のような要求が多い場合は、フレームワーク側の語彙を増やす余地がある。
 
@@ -111,7 +150,7 @@ async def _do_execute(self) -> None:
 
 この場合の改善案は、段階的には次の順で検討する。
 
-1. `execute_params` の慣習として `duration_s` を使い、長時間 `execute` として実装する。
+1. `ExecutionContext` または `execute_params.duration_s` で長時間 `execute` として実装する。
 2. シーケンス定義に相対時間の `hold_seconds` または `duration_s` を追加し、runner が `start_at` / `end_at` を補完できるようにする。
 3. シーケンス行に `kind` を導入し、`change_execute`、`wait`、`action` などを明示できるようにする。
 

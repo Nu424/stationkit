@@ -14,6 +14,8 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel
 
+from stationkit.core.execution_context import ExecutionContext
+
 
 # -----------------------------------------------------------------------------
 # execute 入力仕様の表現
@@ -27,10 +29,12 @@ class ExecuteParamsSpec:
     Attributes:
         model_type: execute が受け取る Pydantic モデル型。入力を取らない場合は ``None``。
         required: execute 入力が必須である場合は ``True``。
+        accepts_context: keyword-only の ``context`` を受け取る場合は ``True``。
     """
 
     model_type: type[BaseModel] | None
     required: bool
+    accepts_context: bool = False
 
     @property
     def accepts_params(self) -> bool:
@@ -110,24 +114,53 @@ def resolve_execute_params_spec(controller: Any) -> ExecuteParamsSpec:
     Raises:
         TypeError: ``_do_execute`` の引数個数や型ヒントが想定外の場合。
     """
-    # まず `_do_execute` が引数なし実装か、単一入力モデル付き実装かを判定する。
     signature = inspect.signature(controller._do_execute)
-    parameters = list(
-        signature.parameters.values()
-    )  # inspect.signature.parametersで、引数を取得
-    if not parameters:
-        # 引数がない場合は、入力形式None・未必須として返却
-        return ExecuteParamsSpec(model_type=None, required=False)
-    if len(parameters) != 1:
+    hints = get_type_hints(controller._do_execute)
+    positional_params: list[inspect.Parameter] = []
+    accepts_context = False
+
+    for parameter in signature.parameters.values():
+        # キーワード専用パラメータの場合、"context"を期待する
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+            if parameter.name != "context":
+                raise TypeError(
+                    f"{type(controller).__name__}._do_execute only supports "
+                    "keyword-only parameter named 'context'."
+                )
+            # contextの型注釈を取得し、ExecutionContext型であることを検証する
+            _validate_context_annotation(
+                type(controller).__name__,
+                hints.get(parameter.name, Any),
+            )
+            accepts_context = True
+            continue
+        
+        # 可変位置引数や可変キーワード引数は使用できない
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            raise TypeError(
+                f"{type(controller).__name__}._do_execute must not use "
+                "*args or **kwargs."
+            )
+        positional_params.append(parameter)
+
+    if not positional_params:
+        # 位置引数がない場合、入力を受け取らない実装であることを示す
+        return ExecuteParamsSpec(
+            model_type=None,
+            required=False,
+            accepts_context=accepts_context,
+        )
+    # 位置引数が1つの場合、その引数を入力として受け取る実装であることを示す
+    if len(positional_params) != 1:
         raise TypeError(
             f"{type(controller).__name__}._do_execute must accept zero or one "
-            "parameter."
+            "positional parameter (plus optional keyword-only context)."
         )
 
-    parameter = parameters[0]
-    hints = get_type_hints(
-        controller._do_execute
-    )  # _do_execute関数の、引数の型一覧を取得
+    parameter = positional_params[0]
     annotation = hints.get(parameter.name, Any)
 
     # execute で許容するのは「Pydantic モデル 1 個」またはその optional だけに絞る。
@@ -146,7 +179,11 @@ def resolve_execute_params_spec(controller: Any) -> ExecuteParamsSpec:
 
     # デフォルト値と `None` 許容有無から、公開 API 上の必須性を決める。
     required = parameter.default is inspect.Signature.empty and not accepts_none
-    return ExecuteParamsSpec(model_type=model_type, required=required)
+    return ExecuteParamsSpec(
+        model_type=model_type,
+        required=required,
+        accepts_context=accepts_context,
+    )
 
 
 def normalize_execute_params(controller: Any, params: Any | None) -> BaseModel | None:
@@ -196,6 +233,24 @@ def normalize_execute_params(controller: Any, params: Any | None) -> BaseModel |
 # -----------------------------------------------------------------------------
 # execute 型注釈の内部解決 helper
 # -----------------------------------------------------------------------------
+
+
+def _validate_context_annotation(controller_name: str, annotation: Any) -> None:
+    """keyword-only ``context`` の型注釈を検証する。
+
+    Args:
+        controller_name: エラーメッセージ用のコントローラ名。
+        annotation: ``context`` 引数の型注釈。
+
+    Raises:
+        TypeError: ``ExecutionContext`` 以外の型が指定された場合。
+    """
+    if annotation is ExecutionContext:
+        return
+    raise TypeError(
+        f"{controller_name}._do_execute keyword-only parameter 'context' "
+        "must be annotated as ExecutionContext."
+    )
 
 
 def _resolve_execute_model_type(

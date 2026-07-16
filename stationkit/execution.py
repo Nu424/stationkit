@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from stationkit.core.base import StationControllerBase
 from stationkit.core.exceptions import StateError
+from stationkit.core.execution_context import ExecutionContext
 from stationkit.core.state import ControllerState
 
 
@@ -95,11 +96,19 @@ class ExecutionManager:
         )
         self._record: _ExecutionRecord | None = None
 
-    def start(self, params: Any | None = None) -> ExecutionHandle:
+    def start(
+        self,
+        params: Any | None = None,
+        *,
+        context: ExecutionContext | None = None,
+    ) -> ExecutionHandle:
         """execute を別スレッドで開始し、即座にハンドルを返す。
 
         Args:
             params: controller.execute() にそのまま渡す execute パラメータ。
+            context: controller へ渡す実行コンテキスト。省略時は
+                ``execution_id`` と ``started_at`` だけを持つ既定値を生成する。
+                呼び出し側が渡した値がある場合は、それらを上書きして共有する。
 
         Returns:
             開始したジョブを識別するハンドル。
@@ -112,11 +121,26 @@ class ExecutionManager:
                 raise StateError("Execution is already running.")
 
             # 実行開始前に公開状態を作り、worker と共有する。
+            execution_id = uuid4().hex
+            started_at = _utcnow()
             status = ExecutionStatus(
-                execution_id=uuid4().hex,
+                execution_id=execution_id,
                 state=ExecutionState.RUNNING,
-                started_at=_utcnow(),
+                started_at=started_at,
             )
+            # status と controller が見る識別子・実開始時刻を一致させる。
+            if context is None:
+                resolved_context = ExecutionContext(
+                    started_at=started_at,
+                    execution_id=execution_id,
+                )
+            else:
+                resolved_context = context.model_copy(
+                    update={
+                        "started_at": started_at,
+                        "execution_id": execution_id,
+                    }
+                )
             record = _ExecutionRecord(status=status)
             self._record = record
 
@@ -125,6 +149,7 @@ class ExecutionManager:
                 self._run_execution, # _run_execution()で、controller.execute()をラップしている
                 status.execution_id,
                 params,
+                resolved_context,
             )
             return ExecutionHandle(execution_id=status.execution_id)
 
@@ -209,18 +234,24 @@ class ExecutionManager:
     # ----------
     # ---以下、ヘルパー関数
     # ----------
-    def _run_execution(self, execution_id: str, params: Any | None) -> None:
+    def _run_execution(
+        self,
+        execution_id: str,
+        params: Any | None,
+        context: ExecutionContext,
+    ) -> None:
         """worker thread 上で controller.execute() を実行する。
 
         Args:
             execution_id: 実行対象ジョブの識別子。
             params: controller.execute() に渡す execute パラメータ。
+            context: controller.execute() に渡す実行コンテキスト。
 
         Returns:
             なし。
         """
         try:
-            result = self._controller.execute(params)
+            result = self._controller.execute(params, context=context)
         except Exception as exc:
             self._finish_with_exception(execution_id, exc)
             return

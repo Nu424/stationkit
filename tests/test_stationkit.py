@@ -26,8 +26,13 @@ from stationkit import (
     ControllerState,
     CustomAction,
     ExecutionCancelledError,
+    ExecutionContext,
     ExecutionManager,
     ExecutionState,
+    SequenceDefinition,
+    SequenceMode,
+    SequenceRunner,
+    SequenceStep,
     StateError,
     create_cli_app,
     create_gui_app,
@@ -190,6 +195,81 @@ class CancellableExecuteController(SlowExecuteController):
         raise ExecutionCancelledError("Execution cancelled.")
 
 
+class ContextOnlyExecuteController(MockStationController):
+    """params 無しで ExecutionContext だけを受け取るモック。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_context: ExecutionContext | None = None
+
+    async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
+        self.last_context = context
+        self._call_log.append("execute(context)")
+        return {
+            "mock": True,
+            "target": self._current_target,
+            "execution_id": context.execution_id,
+            "started_at": context.started_at.isoformat(),
+        }
+
+
+class ContextParameterizedExecuteController(MockStationController):
+    """params と ExecutionContext の両方を受け取るモック。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_context: ExecutionContext | None = None
+        self.last_params: ExecuteInput | None = None
+
+    async def _do_execute(
+        self,
+        params: ExecuteInput,
+        *,
+        context: ExecutionContext,
+    ) -> dict[str, Any]:
+        self.last_params = params
+        self.last_context = context
+        self._call_log.append(
+            f"execute({params.duration_s}, {params.rpm}, context)"
+        )
+        return {
+            "mock": True,
+            "target": self._current_target,
+            "params": params.model_dump(),
+            "scheduled_end_at": (
+                None
+                if context.scheduled_end_at is None
+                else context.scheduled_end_at.isoformat()
+            ),
+        }
+
+
+class ContextAwareCancellableController(MockStationController):
+    """context を受け取りつつ cancel 可能なモック。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self._release = Event()
+        self.cancel_calls = 0
+        self.last_context: ExecutionContext | None = None
+
+    def finish_execution(self) -> None:
+        self._release.set()
+
+    def cancel_execution(self) -> None:
+        self.cancel_calls += 1
+        self.finish_execution()
+
+    async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
+        self.last_context = context
+        self._call_log.append("execute(context)")
+        self.started.set()
+        while not self._release.is_set():
+            await asyncio.sleep(0.01)
+        raise ExecutionCancelledError("Execution cancelled.")
+
+
 def _wait_for_manager_terminal_status(
     manager: ExecutionManager,
     execution_id: str,
@@ -229,6 +309,7 @@ def test_sync_controller_flow() -> None:
         "connect(COM3)",
         "change(4)",
         "execute()",
+        "execute() completed",
         "disconnect()",
     ]
 
@@ -348,6 +429,157 @@ def test_execution_manager_reports_unsupported_cancel() -> None:
     controller.finish_execution()
     status = _wait_for_manager_terminal_status(manager, handle.execution_id)
     assert status.state == ExecutionState.SUCCEEDED
+
+
+def test_execute_context_opt_in_without_params() -> None:
+    """params 無しの context opt-in が直接 execute で動くこと。"""
+    controller = ContextOnlyExecuteController()
+    controller.connect("COM30")
+    controller.change(1)
+
+    result = controller.execute()
+
+    assert controller.last_context is not None
+    assert controller.last_context.execution_id is None
+    assert controller.last_context.scheduled_start_at is None
+    assert controller.last_context.scheduled_end_at is None
+    assert result["execution_id"] is None
+    assert resolve_execute_params_spec(controller).accepts_params is False
+    assert resolve_execute_params_spec(controller).accepts_context is True
+
+
+def test_execute_context_opt_in_with_params() -> None:
+    """params 付きの context opt-in が直接 execute で動くこと。"""
+    controller = ContextParameterizedExecuteController()
+    controller.connect("COM31")
+    controller.change(2)
+
+    result = controller.execute({"duration_s": 4, "rpm": 80})
+
+    assert controller.last_params is not None
+    assert controller.last_params.duration_s == 4
+    assert controller.last_context is not None
+    assert controller.last_context.execution_id is None
+    assert result["params"] == {"duration_s": 4, "rpm": 80}
+    assert resolve_execute_params_spec(controller).accepts_params is True
+    assert resolve_execute_params_spec(controller).accepts_context is True
+
+
+def test_execution_manager_propagates_context_identity() -> None:
+    """ExecutionManager が execution_id / started_at を context と共有すること。"""
+    controller = ContextOnlyExecuteController()
+    controller.connect("COM32")
+    controller.change(3)
+    manager = ExecutionManager(controller)
+
+    handle = manager.start()
+    status = _wait_for_manager_terminal_status(manager, handle.execution_id)
+
+    assert status.state == ExecutionState.SUCCEEDED
+    assert controller.last_context is not None
+    assert controller.last_context.execution_id == handle.execution_id
+    assert controller.last_context.started_at == status.started_at
+    assert controller.last_context.scheduled_start_at is None
+    assert controller.last_context.scheduled_end_at is None
+
+
+def test_sequence_runner_passes_time_driven_schedule_in_context() -> None:
+    """TIME_DRIVEN の予定開始・終了時刻が UTC 正規化されて context に届くこと。"""
+    from datetime import UTC, datetime, timedelta
+
+    controller = ContextAwareCancellableController()
+    controller.connect("COM33")
+    runner = SequenceRunner(controller, poll_interval_s=0.02, cancel_timeout_s=1.0)
+    start_at = datetime.now(UTC) + timedelta(milliseconds=50)
+    end_at = start_at + timedelta(milliseconds=200)
+    definition = SequenceDefinition(
+        name="timed-context",
+        mode=SequenceMode.TIME_DRIVEN,
+        steps=[
+            SequenceStep(
+                id="step-1",
+                label="collect",
+                target=4,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        ],
+    )
+
+    handle = runner.start(definition)
+    assert controller.started.wait(timeout=1.0)
+    assert controller.last_context is not None
+    assert controller.last_context.execution_id is not None
+    assert controller.last_context.sequence_run_id == handle.run_id
+    assert controller.last_context.sequence_step_id == "step-1"
+    assert controller.last_context.sequence_step_index == 0
+    assert controller.last_context.scheduled_start_at == start_at.astimezone(UTC)
+    assert controller.last_context.scheduled_end_at == end_at.astimezone(UTC)
+
+    # end_at 到達による cancel を待つ
+    remaining = 1.5
+    snapshot = None
+    while remaining > 0:
+        snapshot = runner.get_snapshot(handle.run_id)
+        if snapshot.state.value != "RUNNING":
+            break
+        sleep(0.02)
+        remaining -= 0.02
+    assert snapshot is not None
+    assert snapshot.state.value in {"SUCCEEDED", "CANCELLED"}
+    assert controller.cancel_calls >= 1
+
+
+def test_sequence_runner_completion_driven_has_no_schedule_in_context() -> None:
+    """COMPLETION_DRIVEN では予定境界が None のまま context に渡ること。"""
+    controller = ContextOnlyExecuteController()
+    controller.connect("COM34")
+    runner = SequenceRunner(controller, poll_interval_s=0.02)
+    definition = SequenceDefinition(
+        name="completion-context",
+        mode=SequenceMode.COMPLETION_DRIVEN,
+        steps=[SequenceStep(id="step-a", target=5)],
+    )
+
+    handle = runner.start(definition)
+    remaining = 1.0
+    snapshot = None
+    while remaining > 0:
+        snapshot = runner.get_snapshot(handle.run_id)
+        if snapshot.state.value != "RUNNING":
+            break
+        sleep(0.02)
+        remaining -= 0.02
+
+    assert snapshot is not None
+    assert snapshot.state.value == "SUCCEEDED"
+    assert controller.last_context is not None
+    assert controller.last_context.sequence_run_id == handle.run_id
+    assert controller.last_context.sequence_step_id == "step-a"
+    assert controller.last_context.sequence_step_index == 0
+    assert controller.last_context.scheduled_start_at is None
+    assert controller.last_context.scheduled_end_at is None
+
+
+def test_legacy_controllers_remain_compatible_with_context_plumbing() -> None:
+    """既存の 0/1 引数 controller が context 伝播経路でも動くこと。"""
+    no_params = MockStationController()
+    no_params.connect("COM35")
+    no_params.change(1)
+    assert no_params.execute() == {"mock": True, "target": 1}
+
+    with_params = ParameterizedExecuteController()
+    with_params.connect("COM36")
+    with_params.change(2)
+    manager = ExecutionManager(with_params)
+    handle = manager.start({"duration_s": 1, "rpm": 10})
+    status = _wait_for_manager_terminal_status(manager, handle.execution_id)
+    assert status.state == ExecutionState.SUCCEEDED
+    assert status.result == {
+        "mock": True,
+        "target": 2,
+        "params": {"duration_s": 1, "rpm": 10},
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -492,6 +724,7 @@ def test_gui_handlers_share_controller_state_and_refresh_status() -> None:
         "connect(COM7)",
         "change(3)",
         "execute()",
+        "execute() completed",
     ]
 
 
