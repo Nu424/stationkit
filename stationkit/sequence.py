@@ -29,7 +29,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from stationkit.core import StateError, StationControllerBase, TimeoutError
+from stationkit.core import SequenceMode, StateError, StationControllerBase, TimeoutError
 from stationkit.core.execution_context import ExecutionContext
 from stationkit.core.introspection import (
     normalize_execute_params,
@@ -47,18 +47,6 @@ from stationkit.execution import (
 # -----------------------------------------------------------------------------
 # 公開モデル（シーケンス定義・状態・検証結果）
 # -----------------------------------------------------------------------------
-
-
-class SequenceMode(str, Enum):
-    """シーケンス全体の進め方。
-
-    Attributes:
-        COMPLETION_DRIVEN: 前ステップの execute が終端状態になるまで待ってから次へ進む。
-        TIME_DRIVEN: 各行の ``start_at`` / ``end_at`` に従い、終了時刻で ``cancel`` を要求する。
-    """
-
-    COMPLETION_DRIVEN = "COMPLETION_DRIVEN"
-    TIME_DRIVEN = "TIME_DRIVEN"
 
 
 class SequenceRunState(str, Enum):
@@ -377,6 +365,7 @@ class SequenceRunner:
                   （TypeError / ValidationError を ERROR に変換）。
 
             モードとスケジュール:
+                - controller metadata が宣言していないモードは使用不可（ERROR）。
                 - ``TIME_DRIVEN`` では、上記の有効ステップごとに
                   ``start_at`` / ``end_at`` の双方が必須（ERROR）かつ
                   ``end_at`` を UTC 比較で厳密に ``start_at`` より後にする（ERROR）。
@@ -397,6 +386,19 @@ class SequenceRunner:
         issues: list[SequenceIssue] = [] # 問題点を格納するリスト
         enabled_steps: list[tuple[int, SequenceStep]] = [] # 有効なステップを格納するリスト
         seen_ids: set[str] = set() # これまでに確認したステップIDを格納する集合
+        supported_modes = self._controller.get_metadata().sequence_modes
+
+        if normalized.mode not in supported_modes:
+            issues.append(
+                SequenceIssue(
+                    severity=SequenceIssueSeverity.ERROR,
+                    code="unsupported_sequence_mode",
+                    message=(
+                        f"Mode {normalized.mode.value} is not supported by "
+                        f"{type(self._controller).__name__}."
+                    ),
+                )
+            )
 
         # 各ステップに対して検証を行う
         for index, step in enumerate(normalized.steps):
@@ -522,7 +524,10 @@ class SequenceRunner:
             )
 
         # ---時間駆動モードの場合は、cancel_executionをサポートしているかを確認する
-        if normalized.mode == SequenceMode.TIME_DRIVEN:
+        if (
+            normalized.mode == SequenceMode.TIME_DRIVEN
+            and normalized.mode in supported_modes
+        ):
             # ---cancel_executionをサポートしていない場合はエラー
             if not isinstance(self._controller, SupportsExecutionCancellation):
                 issues.append(

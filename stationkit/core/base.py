@@ -23,6 +23,7 @@ from stationkit.core.action import CustomAction
 from stationkit.core.exceptions import ExecutionCancelledError, StateError
 from stationkit.core.execution_context import ExecutionContext
 from stationkit.core.introspection import normalize_execute_params, resolve_execute_params_spec
+from stationkit.core.metadata import ControllerMetadata
 from stationkit.core.state import ControllerState
 
 
@@ -377,8 +378,19 @@ class StationControllerBase(ABC):
         self._run_sync(self.idle_async())
 
     # -------------------------------------------------------------------------
-    # 拡張: 固有操作
+    # 拡張: メタデータ・固有操作
     # -------------------------------------------------------------------------
+
+    def get_metadata(self) -> ControllerMetadata:
+        """アダプタや runner に公開する controller capability を返す。
+
+        デフォルトは終了駆動・時間駆動の両方。対応モードを制限する controller は
+        ``sequence_modes`` を明示したメタデータを返す。
+
+        Returns:
+            controller capability のメタデータ。
+        """
+        return ControllerMetadata()
 
     def get_custom_actions(self) -> list[CustomAction]:
         """アダプタに公開する固有操作の一覧を返す。

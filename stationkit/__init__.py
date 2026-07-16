@@ -14,6 +14,7 @@ from stationkit.adapters import (
 from stationkit.core import (
     CommandError,
     ConnectionError,
+    ControllerMetadata,
     ControllerState,
     CustomAction,
     ExecutionCancelledError,
@@ -48,6 +49,7 @@ from stationkit.testing import MockStationController
 __all__ = [
     "CommandError",
     "ConnectionError",
+    "ControllerMetadata",
     "ControllerState",
     "create_cli_app",
     "create_gui_app",

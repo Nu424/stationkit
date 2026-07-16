@@ -11,15 +11,18 @@ from stationkit.core.exceptions import (
     TimeoutError,
 )
 from stationkit.core.execution_context import ExecutionContext
+from stationkit.core.metadata import ControllerMetadata, SequenceMode
 from stationkit.core.state import ControllerState
 
 __all__ = [
     "CommandError",
     "ConnectionError",
     "ControllerState",
+    "ControllerMetadata",
     "CustomAction",
     "ExecutionCancelledError",
     "ExecutionContext",
+    "SequenceMode",
     "StateError",
     "StationControllerBase",
     "StationError",

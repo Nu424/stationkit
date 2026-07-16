@@ -23,6 +23,7 @@ from stationkit.adapters._form_inputs import (
 import stationkit.adapters.cli as cli_adapter
 import stationkit.adapters.gui as gui_adapter
 from stationkit import (
+    ControllerMetadata,
     ControllerState,
     CustomAction,
     ExecutionCancelledError,
@@ -187,6 +188,14 @@ class CancellableExecuteController(SlowExecuteController):
         self.cancel_calls += 1
         self.finish_execution()
 
+    def get_metadata(self) -> ControllerMetadata:
+        return ControllerMetadata(
+            sequence_modes=(
+                SequenceMode.COMPLETION_DRIVEN,
+                SequenceMode.TIME_DRIVEN,
+            )
+        )
+
     async def _do_execute(self) -> dict[str, Any]:
         self._call_log.append("execute()")
         self.started.set()
@@ -261,6 +270,14 @@ class ContextAwareCancellableController(MockStationController):
         self.cancel_calls += 1
         self.finish_execution()
 
+    def get_metadata(self) -> ControllerMetadata:
+        return ControllerMetadata(
+            sequence_modes=(
+                SequenceMode.COMPLETION_DRIVEN,
+                SequenceMode.TIME_DRIVEN,
+            )
+        )
+
     async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
         self.last_context = context
         self._call_log.append("execute(context)")
@@ -289,6 +306,24 @@ def _wait_for_manager_terminal_status(
 # -----------------------------------------------------------------------------
 # StationControllerBase（同期 API・状態）
 # -----------------------------------------------------------------------------
+
+
+def test_controller_metadata_has_both_modes_by_default_and_validates_modes() -> None:
+    """既定は両モードで、空・重複 capability は拒否すること。"""
+    assert MockStationController().get_metadata().sequence_modes == (
+        SequenceMode.COMPLETION_DRIVEN,
+        SequenceMode.TIME_DRIVEN,
+    )
+
+    with pytest.raises(ValueError, match="at least one"):
+        ControllerMetadata(sequence_modes=())
+    with pytest.raises(ValueError, match="duplicates"):
+        ControllerMetadata(
+            sequence_modes=(
+                SequenceMode.TIME_DRIVEN,
+                SequenceMode.TIME_DRIVEN,
+            )
+        )
 
 
 def test_sync_controller_flow() -> None:

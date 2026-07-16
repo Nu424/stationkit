@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
 from stationkit import (
+    ControllerMetadata,
     ExecutionCancelledError,
     ExecutionContext,
     SequenceMode,
@@ -92,6 +93,15 @@ class CancellableExecuteController(SlowExecuteController):
         self.cancel_calls += 1
         self.finish_execution()
 
+    def get_metadata(self) -> ControllerMetadata:
+        """終了駆動・時間駆動の両方を宣言する。"""
+        return ControllerMetadata(
+            sequence_modes=(
+                SequenceMode.COMPLETION_DRIVEN,
+                SequenceMode.TIME_DRIVEN,
+            )
+        )
+
     async def _do_execute(self) -> dict[str, Any]:
         self._call_log.append("execute()")
         self.started.set()
@@ -138,6 +148,15 @@ class ContextAwareCancellableController(ContextAwareExecuteController):
         self.cancel_calls += 1
         self.finish_execution()
 
+    def get_metadata(self) -> ControllerMetadata:
+        """終了駆動・時間駆動の両方を宣言する。"""
+        return ControllerMetadata(
+            sequence_modes=(
+                SequenceMode.COMPLETION_DRIVEN,
+                SequenceMode.TIME_DRIVEN,
+            )
+        )
+
     async def _do_execute(self, *, context: ExecutionContext) -> dict[str, Any]:
         self.last_context = context
         self._call_log.append("execute(context)")
@@ -145,6 +164,27 @@ class ContextAwareCancellableController(ContextAwareExecuteController):
         while not self._release.is_set():
             await asyncio.sleep(0.01)
         raise ExecutionCancelledError("Execution cancelled.")
+
+
+class TimeDrivenOnlyController(CancellableExecuteController):
+    """時間駆動だけを公開する controller。"""
+
+    def get_metadata(self) -> ControllerMetadata:
+        return ControllerMetadata(sequence_modes=(SequenceMode.TIME_DRIVEN,))
+
+
+class CompletionDrivenOnlyController(MockStationController):
+    """終了駆動だけを公開する controller。"""
+
+    def get_metadata(self) -> ControllerMetadata:
+        return ControllerMetadata(sequence_modes=(SequenceMode.COMPLETION_DRIVEN,))
+
+
+class TimeDrivenWithoutCancelController(MockStationController):
+    """時間駆動を宣言するが cancel hook を持たない controller。"""
+
+    def get_metadata(self) -> ControllerMetadata:
+        return ControllerMetadata(sequence_modes=(SequenceMode.TIME_DRIVEN,))
 
 
 def _wait_for_status_condition(
@@ -184,6 +224,33 @@ def test_sequence_http_meta_and_status_bootstrap() -> None:
     assert status.json()["controller"]["controller_state"] == "DISCONNECTED"
     assert status.json()["manual_execution"] is None
     assert status.json()["sequence"] is None
+
+
+def test_sequence_http_meta_uses_controller_sequence_modes() -> None:
+    """controller の宣言順を API の選択肢として返すこと。"""
+    default_meta = TestClient(
+        create_sequence_http_app(MockStationController())
+    ).get("/api/meta").json()
+    completion_meta = TestClient(
+        create_sequence_http_app(CompletionDrivenOnlyController())
+    ).get("/api/meta").json()
+    both_meta = TestClient(
+        create_sequence_http_app(CancellableExecuteController())
+    ).get("/api/meta").json()
+    time_meta = TestClient(
+        create_sequence_http_app(TimeDrivenOnlyController())
+    ).get("/api/meta").json()
+
+    assert default_meta["sequence_modes"] == [
+        "COMPLETION_DRIVEN",
+        "TIME_DRIVEN",
+    ]
+    assert completion_meta["sequence_modes"] == ["COMPLETION_DRIVEN"]
+    assert both_meta["sequence_modes"] == [
+        "COMPLETION_DRIVEN",
+        "TIME_DRIVEN",
+    ]
+    assert time_meta["sequence_modes"] == ["TIME_DRIVEN"]
 
 
 def test_sequence_http_meta_keeps_optional_bool_as_nullable_bool_field() -> None:
@@ -237,9 +304,11 @@ def test_sequence_http_manual_idle() -> None:
     assert client.post("/api/controller/idle").status_code == 409
 
 
-def test_sequence_http_validate_and_time_driven_cancel_unsupported() -> None:
-    """time-driven を cancel 未対応 controller が validation で拒否されること。"""
-    client = TestClient(create_sequence_http_app(MockStationController()))
+def test_sequence_http_validate_rejects_unsupported_sequence_mode() -> None:
+    """controller が宣言していないモードを validation で拒否すること。"""
+    client = TestClient(
+        create_sequence_http_app(CompletionDrivenOnlyController())
+    )
     now = datetime.now(UTC)
     definition = {
         "name": "timed",
@@ -258,7 +327,46 @@ def test_sequence_http_validate_and_time_driven_cancel_unsupported() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is False
-    assert {issue["code"] for issue in body["issues"]} >= {"cancel_not_supported"}
+    assert {issue["code"] for issue in body["issues"]} >= {
+        "unsupported_sequence_mode"
+    }
+    assert "cancel_not_supported" not in {
+        issue["code"] for issue in body["issues"]
+    }
+
+    run_response = client.post(
+        "/api/sequence/run", json={"definition": definition}
+    )
+    assert run_response.status_code == 422
+    assert "not supported" in run_response.json()["detail"]
+
+
+def test_sequence_http_validate_requires_cancel_for_declared_time_mode() -> None:
+    """時間駆動を宣言しても cancel hook がなければ拒否すること。"""
+    client = TestClient(
+        create_sequence_http_app(TimeDrivenWithoutCancelController())
+    )
+    now = datetime.now(UTC)
+    definition = {
+        "name": "timed-without-cancel",
+        "mode": SequenceMode.TIME_DRIVEN.value,
+        "steps": [
+            {
+                "target": 1,
+                "start_at": (now + timedelta(seconds=1)).isoformat(),
+                "end_at": (now + timedelta(seconds=2)).isoformat(),
+            }
+        ],
+    }
+
+    body = client.post(
+        "/api/sequence/validate", json={"definition": definition}
+    ).json()
+
+    assert body["ok"] is False
+    assert {issue["code"] for issue in body["issues"]} >= {
+        "cancel_not_supported"
+    }
 
 
 def test_sequence_http_run_and_stop_sequence() -> None:

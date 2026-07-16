@@ -16,7 +16,7 @@ from threading import Lock
 from time import perf_counter
 from typing import Any, Literal, TypeAlias
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, TypeAdapter
 
@@ -171,6 +171,7 @@ def create_sequence_http_app(
     sequence_runner = SequenceRunner(controller) # シーケンス実行用のSequenceRunner(こいつはこいつで内部にExecutionManagerを持っている)
     target_adapter = TypeAdapter(resolve_target_type(controller))
     execute_params_spec = resolve_execute_params_spec(controller)
+    controller_metadata = controller.get_metadata()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -235,7 +236,9 @@ def create_sequence_http_app(
             controller_name=type(controller).__name__,
             target=_build_target_meta(controller),
             execute=_build_execute_meta(execute_params_spec),
-            sequence_modes=["COMPLETION_DRIVEN", "TIME_DRIVEN"],
+            sequence_modes=[
+                mode.value for mode in controller_metadata.sequence_modes
+            ],
             custom_actions=[
                 _build_custom_action_meta(action)
                 for action in controller.get_custom_actions()
@@ -401,7 +404,10 @@ def create_sequence_http_app(
             Returns:
                 開始した run の最新 snapshot。
             """
-            handle = await asyncio.to_thread(sequence_runner.start, req.definition)
+            try:
+                handle = await asyncio.to_thread(sequence_runner.start, req.definition)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
             return await asyncio.to_thread(sequence_runner.get_snapshot, handle.run_id)
 
         return await _run_sequence_http_operation(
