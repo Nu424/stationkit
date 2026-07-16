@@ -16,6 +16,7 @@ import { useSequenceStore } from '../store/sequenceStore'
 
 export function RunToolbar() {
   const language = useSequenceStore((state) => state.language)
+  const meta = useSequenceStore((state) => state.meta)
   const definition = useSequenceStore((state) => state.definition)
   const ui = useSequenceStore((state) => state.ui)
   const sequenceSnapshot = useSequenceStore((state) => state.sequenceSnapshot)
@@ -40,6 +41,7 @@ export function RunToolbar() {
     sequenceSnapshot !== null &&
     ['RUNNING', 'STOPPING'].includes(sequenceSnapshot.state)
   const isLoading = ui.pendingRequests > 0
+  const availableModes = meta?.sequence_modes ?? [definition.mode]
 
   const handleExport = () => {
     const blob = new Blob([exportDefinition()], { type: 'application/json' })
@@ -83,11 +85,17 @@ export function RunToolbar() {
                   event.target.value as 'COMPLETION_DRIVEN' | 'TIME_DRIVEN',
                 )
               }
-              disabled={sequenceBusy}
+              disabled={sequenceBusy || availableModes.length === 1}
               className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-100 outline-none transition focus:border-cyan-400 disabled:cursor-not-allowed disabled:text-slate-500"
             >
-              <option value="COMPLETION_DRIVEN">{t(language, 'modeCompletion')}</option>
-              <option value="TIME_DRIVEN">{t(language, 'modeTime')}</option>
+              {availableModes.map((mode) => (
+                <option key={mode} value={mode}>
+                  {t(
+                    language,
+                    mode === 'COMPLETION_DRIVEN' ? 'modeCompletion' : 'modeTime',
+                  )}
+                </option>
+              ))}
             </select>
           </label>
         </div>
@@ -157,7 +165,7 @@ export function RunToolbar() {
             aria-label={t(language, 'exportJson')}
             className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-200 transition hover:bg-slate-900"
           >
-            <FiDownload className="h-4 w-4" />
+            <FiUpload className="h-4 w-4" />
           </button>
           <button
             type="button"
@@ -166,7 +174,7 @@ export function RunToolbar() {
             aria-label={t(language, 'importJson')}
             className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-200 transition hover:bg-slate-900"
           >
-            <FiUpload className="h-4 w-4" />
+            <FiDownload className="h-4 w-4" />
           </button>
           {!confirmingReset ? (
             <button

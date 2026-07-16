@@ -266,13 +266,12 @@ export const useSequenceStore = create<SequenceStore>()(
             const meta = await sequenceApi.getMeta()
             set((state) => ({
               meta,
-              definition:
-                state.definition.steps.length > 0
-                  ? state.definition
-                  : {
-                      ...state.definition,
-                      mode: meta.sequence_modes[0] ?? state.definition.mode,
-                    },
+              definition: {
+                ...state.definition,
+                mode: meta.sequence_modes.includes(state.definition.mode)
+                  ? state.definition.mode
+                  : (meta.sequence_modes[0] ?? state.definition.mode),
+              },
             }))
           } catch (error) {
             setError(error)
@@ -480,7 +479,10 @@ export const useSequenceStore = create<SequenceStore>()(
 
         resetDefinition() {
           set((state) => ({
-            definition: defaultDefinition,
+            definition: {
+              ...defaultDefinition,
+              mode: state.meta?.sequence_modes[0] ?? defaultDefinition.mode,
+            },
             selectedStepIndex: null,
             issues: [],
             sequenceSnapshot: null,
@@ -496,6 +498,13 @@ export const useSequenceStore = create<SequenceStore>()(
           try {
             const parsed = JSON.parse(jsonText) as Partial<SequenceDefinition>
             const definition = normalizeImportedDefinition(parsed)
+            const meta = get().meta
+            if (
+              meta !== null &&
+              !meta.sequence_modes.includes(definition.mode)
+            ) {
+              throw new Error(t(get().language, 'unsupportedImportedMode'))
+            }
             set((state) => ({
               definition,
               selectedStepIndex: definition.steps.length > 0 ? 0 : null,

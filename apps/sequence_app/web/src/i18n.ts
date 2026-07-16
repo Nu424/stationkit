@@ -67,6 +67,8 @@ const messages = {
     modeTime: 'Time Driven',
     dragToReorder: 'Drag to reorder',
     invalidJson: 'Invalid JSON',
+    unsupportedImportedMode:
+      'The imported sequence mode is not supported by this controller.',
     requiresNoParams: 'This controller does not require execute parameters.',
     unexpectedError: 'Unexpected error occurred.',
     runId: 'Run ID',
@@ -140,6 +142,8 @@ const messages = {
     modeTime: '時間駆動',
     dragToReorder: 'ドラッグで並び替え',
     invalidJson: 'JSONの形式が不正です',
+    unsupportedImportedMode:
+      '読み込んだシーケンスの実行モードは、このコントローラーでは使用できません。',
     requiresNoParams: 'このコントローラーは実行パラメータを必要としません。',
     unexpectedError: '予期しないエラーが発生しました。',
     runId: '実行ID',
