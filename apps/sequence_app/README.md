@@ -70,7 +70,9 @@ static 配信が不要なら、library 側の `create_sequence_http_app(controll
 
 - connect → add step → validate → run → stop
 - connect 後に「待機状態へ（Go Idle）」ボタンで idle へ移せること（status の `routing` が更新される）
+- controller の `get_metadata().sequence_modes` に応じて実行モードの選択肢が絞られること
+- 単一モードの controller では実行モードを変更できないこと
 - time-driven step の start/end 表示と countdown 表示
-- import/export roundtrip
+- import/export roundtrip と、未対応モードを含む JSON の import 拒否
 - single-step check の load / start
 - 実行中の disable 制御

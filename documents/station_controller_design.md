@@ -270,6 +270,33 @@ class CustomAction:
     output_schema: Optional[Type[BaseModel]] = None  # 戻り値の型 (任意)
 ```
 
+### 3.5 controller capability: `ControllerMetadata`
+
+Sequence App 固有の設定を server factory に渡すのではなく、controller が
+`get_metadata()` で対応 capability を宣言する。`sequence_modes` は非空かつ重複なしの
+tuple とし、先頭を UI の既定モードとして扱う。
+
+```python
+from stationkit import ControllerMetadata, SequenceMode
+
+
+def get_metadata(self) -> ControllerMetadata:
+    return ControllerMetadata(
+        sequence_modes=(
+            SequenceMode.COMPLETION_DRIVEN,
+            SequenceMode.TIME_DRIVEN,
+        )
+    )
+```
+
+- 未指定時: `COMPLETION_DRIVEN` と `TIME_DRIVEN` の両方
+- 時間駆動のみ: `(SequenceMode.TIME_DRIVEN,)`
+- 両対応: `(SequenceMode.COMPLETION_DRIVEN, SequenceMode.TIME_DRIVEN)`
+
+`GET /api/meta` はこの宣言を frontend へ渡し、`SequenceRunner.validate()` も同じ宣言を
+実行可否の正本として使う。時間駆動は終了時刻で実行を中断するため、
+`TIME_DRIVEN` を宣言する controller は `cancel_execution()` も実装しなければならない。
+
 ---
 
 ## 4. 具体クラスの実装例

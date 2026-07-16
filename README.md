@@ -608,6 +608,33 @@ uvicorn.run(app, host="127.0.0.1", port=8000)
 別の frontend build 出力を使いたい場合だけ、`frontend_dist_dir` に build 済みディレクトリを渡してください。
 開発手順と手動確認項目は `apps/sequence_app/README.md` を参照してください。
 
+### controller が対応するシーケンスモード
+
+`get_metadata()` で対応モードを宣言すると、Sequence App の選択肢と
+`SequenceRunner` の検証へ同じ制約が反映されます。未指定時は終了駆動と時間駆動です。
+tuple の先頭が UI の既定モードになります。
+
+```python
+from stationkit import ControllerMetadata, SequenceMode, StationControllerBase
+
+
+class BothModesController(StationControllerBase):
+    # ... 必須メソッドは省略 ...
+
+    def get_metadata(self) -> ControllerMetadata:
+        return ControllerMetadata(
+            sequence_modes=(
+                SequenceMode.COMPLETION_DRIVEN,
+                SequenceMode.TIME_DRIVEN,
+            )
+        )
+```
+
+時間駆動だけなら `sequence_modes=(SequenceMode.TIME_DRIVEN,)`、終了駆動だけなら
+`sequence_modes=(SequenceMode.COMPLETION_DRIVEN,)` を返します。時間駆動を宣言する
+controller は、安全に処理を中断する `cancel_execution()` も実装してください。
+宣言と実装が一致しない場合は `cancel_not_supported` として検証エラーになります。
+
 ## Gradio GUI として動かす
 
 Gradio ベースの GUI は `create_gui_app()` で生成します。返り値は `gr.Blocks` なので、呼び出し側で `launch()` してください。
