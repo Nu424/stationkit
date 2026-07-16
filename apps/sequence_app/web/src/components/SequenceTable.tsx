@@ -41,18 +41,29 @@ function formatValue(value: unknown, fallback: string): string {
   return JSON.stringify(value)
 }
 
-function formatSchedule(
-  startAt: string | null,
-  endAt: string | null,
-  fallback: string,
-): string {
+function ScheduleDisplay({
+  startAt,
+  endAt,
+  fallback,
+}: {
+  startAt: string | null
+  endAt: string | null
+  fallback: string
+}) {
   if (startAt === null && endAt === null) {
-    return fallback
+    return <span>{fallback}</span>
   }
-  if (startAt !== null && endAt !== null) {
-    return `${startAt} -> ${endAt}`
-  }
-  return startAt ?? endAt ?? fallback
+  return (
+    <span className="block text-xs leading-relaxed">
+      {startAt !== null && <span className="block whitespace-nowrap">{startAt}</span>}
+      {startAt !== null && endAt !== null && (
+        <span className="block whitespace-nowrap text-slate-400">→ {endAt}</span>
+      )}
+      {startAt === null && endAt !== null && (
+        <span className="block whitespace-nowrap">{endAt}</span>
+      )}
+    </span>
+  )
 }
 
 function summarizeExecuteParams(
@@ -409,7 +420,11 @@ function InlineScheduleEditor({
         }}
         className="w-full rounded-lg border border-transparent bg-slate-900/70 px-2 py-2 text-left text-slate-200 transition hover:border-slate-700 hover:bg-slate-900 disabled:cursor-not-allowed disabled:text-slate-500"
       >
-        {formatSchedule(startAt, endAt, t(language, 'notAvailable'))}
+        <ScheduleDisplay
+          startAt={startAt}
+          endAt={endAt}
+          fallback={t(language, 'notAvailable')}
+        />
       </button>
     )
   }
@@ -425,15 +440,27 @@ function InlineScheduleEditor({
           className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-2 text-slate-100 outline-none transition focus:border-cyan-400"
         />
       </label>
-      <label className="flex flex-col gap-1 text-xs text-slate-300">
-        {t(language, 'endsAt')}
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between gap-2 text-xs text-slate-300">
+          <span>{t(language, 'endsAt')}</span>
+          <button
+            type="button"
+            onClick={() => setDraftEnd(draftStart)}
+            disabled={draftStart === ''}
+            title={t(language, 'copyStartToEnd')}
+            aria-label={t(language, 'copyStartToEnd')}
+            className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded border border-slate-700 text-slate-400 transition hover:border-cyan-500/50 hover:text-cyan-300 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <FiCopy className="h-3 w-3" />
+          </button>
+        </div>
         <input
           type="datetime-local"
           value={draftEnd}
           onChange={(event) => setDraftEnd(event.target.value)}
           className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-2 text-slate-100 outline-none transition focus:border-cyan-400"
         />
-      </label>
+      </div>
       <div className="flex gap-1">
         <button
           type="button"
