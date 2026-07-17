@@ -187,6 +187,20 @@ class TimeDrivenWithoutCancelController(MockStationController):
         return ControllerMetadata(sequence_modes=(SequenceMode.TIME_DRIVEN,))
 
 
+class OnceFailingController(MockStationController):
+    """最初の execute だけ失敗し、ERROR 復帰後の再実行を検証する。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = True
+
+    async def _do_execute(self) -> dict[str, Any]:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("boom-once")
+        return await super()._do_execute()
+
+
 def _wait_for_status_condition(
     client: TestClient,
     predicate,
@@ -567,3 +581,104 @@ def test_sequence_http_time_driven_passes_schedule_in_context() -> None:
     )
     assert terminal["sequence"]["state"] in {"SUCCEEDED", "CANCELLED"}
     assert controller.cancel_calls >= 1
+
+
+def test_sequence_http_error_recovery_via_disconnect_and_reconnect() -> None:
+    """execute 失敗後は ERROR になり、disconnect → connect で復帰できること。"""
+    controller = OnceFailingController()
+    client = TestClient(create_sequence_http_app(controller))
+    client.post("/api/controller/connect", json={"address": "COM60"})
+    definition = {
+        "name": "error-recovery",
+        "steps": [{"label": "only", "target": 2}],
+    }
+
+    started = client.post("/api/sequence/run", json={"definition": definition})
+    assert started.status_code == 200
+
+    terminal = _wait_for_status_condition(
+        client,
+        lambda payload: payload["sequence"] is not None
+        and payload["sequence"]["state"] == "FAILED",
+    )
+    assert terminal["controller"]["controller_state"] == "ERROR"
+
+    blocked_run = client.post("/api/sequence/run", json={"definition": definition})
+    assert blocked_run.status_code == 409
+    assert "CONNECTED" in blocked_run.json()["detail"]
+    assert "ERROR" in blocked_run.json()["detail"]
+
+    blocked_connect = client.post(
+        "/api/controller/connect",
+        json={"address": "COM60"},
+    )
+    assert blocked_connect.status_code == 409
+    assert "DISCONNECTED" in blocked_connect.json()["detail"]
+
+    assert client.post("/api/controller/disconnect").json() == {"ok": True}
+    assert client.get("/api/status").json()["controller"]["controller_state"] == (
+        "DISCONNECTED"
+    )
+
+    assert client.post("/api/controller/connect", json={"address": "COM60"}).json() == {
+        "ok": True
+    }
+    assert client.get("/api/status").json()["controller"]["controller_state"] == (
+        "CONNECTED"
+    )
+
+    recovered = client.post("/api/sequence/run", json={"definition": definition})
+    assert recovered.status_code == 200
+    recovered_terminal = _wait_for_status_condition(
+        client,
+        lambda payload: payload["sequence"] is not None
+        and payload["sequence"]["state"] == "SUCCEEDED",
+    )
+    assert recovered_terminal["controller"]["controller_state"] == "CONNECTED"
+
+
+def test_sequence_http_check_step_rejects_controller_error() -> None:
+    """check-step 失敗後の ERROR でも再 start を開始前に拒否すること。"""
+    controller = OnceFailingController()
+    client = TestClient(create_sequence_http_app(controller))
+    client.post("/api/controller/connect", json={"address": "COM61"})
+    definition = {
+        "name": "check-error",
+        "steps": [{"label": "only", "target": 4}],
+    }
+
+    started = client.post(
+        "/api/sequence/check-step",
+        json={"definition": definition, "step_index": 0},
+    )
+    assert started.status_code == 200
+    _wait_for_status_condition(
+        client,
+        lambda payload: payload["manual_execution"] is not None
+        and payload["manual_execution"]["state"] == "FAILED"
+        and payload["controller"]["controller_state"] == "ERROR",
+    )
+
+    blocked = client.post(
+        "/api/sequence/check-step",
+        json={"definition": definition, "step_index": 0},
+    )
+    assert blocked.status_code == 409
+    assert "CONNECTED" in blocked.json()["detail"]
+    assert "ERROR" in blocked.json()["detail"]
+
+    assert client.post("/api/controller/disconnect").json() == {"ok": True}
+    assert client.post("/api/controller/connect", json={"address": "COM61"}).json() == {
+        "ok": True
+    }
+    recovered = client.post(
+        "/api/sequence/check-step",
+        json={"definition": definition, "step_index": 0},
+    )
+    assert recovered.status_code == 200
+    terminal = _wait_for_status_condition(
+        client,
+        lambda payload: payload["manual_execution"] is not None
+        and payload["manual_execution"]["state"] == "SUCCEEDED",
+    )
+    assert terminal["controller"]["controller_state"] == "CONNECTED"

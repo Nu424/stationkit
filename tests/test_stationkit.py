@@ -55,6 +55,20 @@ class FailingController(MockStationController):
         raise RuntimeError("boom")
 
 
+class OnceFailingController(MockStationController):
+    """最初の execute だけ失敗し、再接続後の再実行を検証する。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = True
+
+    async def _do_execute(self) -> dict[str, Any]:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("boom-once")
+        return await super()._do_execute()
+
+
 class CalibrateInput(BaseModel):
     """CustomAction 用の入力スキーマ（テスト）。"""
 
@@ -532,6 +546,90 @@ def test_execution_manager_maps_failures_and_cancellations() -> None:
     assert status.cancel_requested is True
     assert cancellable.cancel_calls == 1
     assert cancellable.state == ControllerState.CONNECTED
+
+
+def test_error_state_blocks_start_until_disconnect_reconnect() -> None:
+    """ERROR 後は start を拒否し、disconnect → connect で復帰できること。"""
+    controller = OnceFailingController()
+    controller.connect("COM24")
+    controller.change(3)
+    manager = ExecutionManager(controller)
+
+    failed = manager.start()
+    failed_status = _wait_for_manager_terminal_status(manager, failed.execution_id)
+    assert failed_status.state == ExecutionState.FAILED
+    assert controller.state == ControllerState.ERROR
+
+    with pytest.raises(StateError, match="requires CONNECTED state, current: ERROR"):
+        manager.start()
+
+    with pytest.raises(StateError, match="connect requires DISCONNECTED"):
+        controller.connect("COM24")
+
+    idle_calls_before_disconnect = controller.call_log.count("idle()")
+    controller.disconnect()
+    assert controller.state == ControllerState.DISCONNECTED
+    # ERROR からの切断では装置状態が不確かなため idle を呼ばない。
+    assert controller.call_log.count("idle()") == idle_calls_before_disconnect
+
+    controller.connect("COM24")
+    controller.change(3)
+    assert controller.state == ControllerState.CONNECTED
+
+    recovered = manager.start()
+    recovered_status = _wait_for_manager_terminal_status(
+        manager,
+        recovered.execution_id,
+    )
+    assert recovered_status.state == ExecutionState.SUCCEEDED
+    assert controller.state == ControllerState.CONNECTED
+
+
+def test_sequence_runner_rejects_start_while_controller_error() -> None:
+    """SequenceRunner も ERROR 中は開始前に拒否し、復帰後に再実行できること。"""
+    controller = OnceFailingController()
+    controller.connect("COM25")
+    runner = SequenceRunner(controller, poll_interval_s=0.02)
+    definition = SequenceDefinition(
+        name="error-recovery",
+        mode=SequenceMode.COMPLETION_DRIVEN,
+        steps=[SequenceStep(id="step-1", target=1)],
+    )
+
+    handle = runner.start(definition)
+    remaining = 1.0
+    snapshot = None
+    while remaining > 0:
+        snapshot = runner.get_snapshot(handle.run_id)
+        if snapshot.state.value != "RUNNING":
+            break
+        sleep(0.02)
+        remaining -= 0.02
+
+    assert snapshot is not None
+    assert snapshot.state.value == "FAILED"
+    assert controller.state == ControllerState.ERROR
+
+    with pytest.raises(StateError, match="requires CONNECTED state, current: ERROR"):
+        runner.start(definition)
+
+    controller.disconnect()
+    controller.connect("COM25")
+    assert controller.state == ControllerState.CONNECTED
+
+    recovered = runner.start(definition)
+    remaining = 1.0
+    recovered_snapshot = None
+    while remaining > 0:
+        recovered_snapshot = runner.get_snapshot(recovered.run_id)
+        if recovered_snapshot.state.value != "RUNNING":
+            break
+        sleep(0.02)
+        remaining -= 0.02
+
+    assert recovered_snapshot is not None
+    assert recovered_snapshot.state.value == "SUCCEEDED"
+    assert controller.state == ControllerState.CONNECTED
 
 
 def test_execution_manager_reports_unsupported_cancel() -> None:
