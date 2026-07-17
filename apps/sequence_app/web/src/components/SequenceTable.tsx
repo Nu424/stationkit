@@ -500,6 +500,7 @@ interface SortableStepRowProps {
   runtime: SequenceStepStatus | null
   sequenceBusy: boolean
   manualBusy: boolean
+  canRun: boolean
   onSelect: () => void
   onToggleEnabled: (enabled: boolean) => void
   onUpdateTarget: (value: unknown) => void
@@ -519,6 +520,7 @@ function SortableStepRow({
   runtime,
   sequenceBusy,
   manualBusy,
+  canRun,
   onSelect,
   onToggleEnabled,
   onUpdateTarget,
@@ -633,9 +635,13 @@ function SortableStepRow({
               event.stopPropagation()
               onSingleRun()
             }}
-            disabled={sequenceBusy || manualBusy}
-            title={t(language, 'singleRun')}
-            aria-label={t(language, 'singleRun')}
+            disabled={sequenceBusy || manualBusy || !canRun}
+            title={
+              canRun ? t(language, 'singleRun') : t(language, 'runRequiresConnected')
+            }
+            aria-label={
+              canRun ? t(language, 'singleRun') : t(language, 'runRequiresConnected')
+            }
             className="rounded-lg p-2 text-cyan-400 transition hover:bg-cyan-500/10 disabled:cursor-not-allowed disabled:text-slate-600"
           >
             <FiPlay className="h-4 w-4" />
@@ -677,6 +683,7 @@ export function SequenceTable() {
   const meta = useSequenceStore((state) => state.meta)
   const definition = useSequenceStore((state) => state.definition)
   const selectedStepIndex = useSequenceStore((state) => state.selectedStepIndex)
+  const controllerStatus = useSequenceStore((state) => state.controllerStatus)
   const manualExecutionStatus = useSequenceStore((state) => state.manualExecutionStatus)
   const sequenceSnapshot = useSequenceStore((state) => state.sequenceSnapshot)
   const addStep = useSequenceStore((state) => state.addStep)
@@ -696,6 +703,7 @@ export function SequenceTable() {
   const isManualBusy =
     manualExecutionStatus !== null &&
     ['RUNNING', 'CANCELLING'].includes(manualExecutionStatus.state)
+  const canRun = controllerStatus?.controller_state === 'CONNECTED'
 
   const runtimeSteps = useMemo(() => sequenceSnapshot?.steps ?? [], [sequenceSnapshot])
   const dialogStep = detailsIndex === null ? null : definition.steps[detailsIndex] ?? null
@@ -755,6 +763,7 @@ export function SequenceTable() {
                       runtime={getRuntimeStep(runtimeSteps, step.id)}
                       sequenceBusy={isSequenceBusy}
                       manualBusy={isManualBusy}
+                      canRun={canRun}
                       onSelect={() => selectStep(index)}
                       onToggleEnabled={(enabled) => updateStep(index, { enabled })}
                       onUpdateTarget={(value) => updateStep(index, { target: value })}

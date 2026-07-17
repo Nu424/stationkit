@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { FiGlobe, FiLogIn, FiLogOut, FiPause } from 'react-icons/fi'
+import { FiAlertTriangle, FiGlobe, FiLogIn, FiLogOut, FiPause } from 'react-icons/fi'
 
 import { t } from '../i18n'
 import { useSequenceStore } from '../store/sequenceStore'
@@ -29,6 +29,10 @@ export function DevicePanel() {
   const isLoading = ui.pendingRequests > 0
   const controllerState = controllerStatus?.controller_state ?? 'UNKNOWN'
   const isConnected = controllerState === 'CONNECTED'
+  const isDisconnected = controllerState === 'DISCONNECTED'
+  const isError = controllerState === 'ERROR'
+  // ERROR からの公式復帰は disconnect → connect。BUSY 中は実行系が排他するため切断しない。
+  const canDisconnect = isConnected || isError
 
   return (
     <section className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 shadow-lg shadow-black/20">
@@ -82,7 +86,7 @@ export function DevicePanel() {
           <button
             type="button"
             onClick={() => void connect(address)}
-            disabled={isLoading || address.trim() === '' || isConnected}
+            disabled={isLoading || address.trim() === '' || !isDisconnected}
             title={t(language, 'connect')}
             aria-label={t(language, 'connect')}
             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-cyan-500 text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
@@ -102,7 +106,7 @@ export function DevicePanel() {
           <button
             type="button"
             onClick={() => void disconnect()}
-            disabled={isLoading || !isConnected}
+            disabled={isLoading || !canDisconnect}
             title={t(language, 'disconnect')}
             aria-label={t(language, 'disconnect')}
             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-200 transition hover:border-slate-500 hover:bg-slate-900 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
@@ -111,6 +115,13 @@ export function DevicePanel() {
           </button>
         </div>
       </div>
+
+      {isError && (
+        <div className="mt-3 flex items-start gap-2 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-100">
+          <FiAlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <span>{t(language, 'errorRecoveryHint')}</span>
+        </div>
+      )}
     </section>
   )
 }

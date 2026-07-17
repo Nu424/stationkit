@@ -19,6 +19,7 @@ export function RunToolbar() {
   const meta = useSequenceStore((state) => state.meta)
   const definition = useSequenceStore((state) => state.definition)
   const ui = useSequenceStore((state) => state.ui)
+  const controllerStatus = useSequenceStore((state) => state.controllerStatus)
   const sequenceSnapshot = useSequenceStore((state) => state.sequenceSnapshot)
   const setSequenceName = useSequenceStore((state) => state.setSequenceName)
   const setSequenceMode = useSequenceStore((state) => state.setSequenceMode)
@@ -41,6 +42,8 @@ export function RunToolbar() {
     sequenceSnapshot !== null &&
     ['RUNNING', 'STOPPING'].includes(sequenceSnapshot.state)
   const isLoading = ui.pendingRequests > 0
+  const isControllerConnected =
+    controllerStatus?.controller_state === 'CONNECTED'
   const availableModes = meta?.sequence_modes ?? [definition.mode]
 
   const handleExport = () => {
@@ -114,9 +117,17 @@ export function RunToolbar() {
           <button
             type="button"
             onClick={() => void runSequence()}
-            disabled={isLoading || sequenceBusy}
-            title={t(language, 'runSequence')}
-            aria-label={t(language, 'runSequence')}
+            disabled={isLoading || sequenceBusy || !isControllerConnected}
+            title={
+              isControllerConnected
+                ? t(language, 'runSequence')
+                : t(language, 'runRequiresConnected')
+            }
+            aria-label={
+              isControllerConnected
+                ? t(language, 'runSequence')
+                : t(language, 'runRequiresConnected')
+            }
             className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-500 text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
           >
             {isLoading && !sequenceBusy ? (

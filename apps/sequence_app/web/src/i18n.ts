@@ -76,6 +76,9 @@ const messages = {
     loading: 'Loading...',
     disabled: 'Disabled',
     confirmResetAction: 'Confirm Reset',
+    errorRecoveryHint:
+      'Controller is in ERROR. Disconnect, then reconnect before running again.',
+    runRequiresConnected: 'Connect the device before running.',
   },
   ja: {
     appTitle: 'シーケンスアプリ',
@@ -152,6 +155,9 @@ const messages = {
     loading: '読み込み中...',
     disabled: '無効',
     confirmResetAction: 'リセットを確定',
+    errorRecoveryHint:
+      'コントローラが ERROR です。切断してから再接続し、その後に実行してください。',
+    runRequiresConnected: '実行する前にデバイスへ接続してください。',
   },
 } as const
 
