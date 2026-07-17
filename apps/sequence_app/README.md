@@ -76,3 +76,6 @@ static 配信が不要なら、library 側の `create_sequence_http_app(controll
 - import/export roundtrip と、未対応モードを含む JSON の import 拒否
 - single-step check の load / start
 - 実行中の disable 制御
+- execute 失敗で controller が `ERROR` になったとき、切断ボタンが有効で接続/実行ボタンが無効になること
+- `ERROR` 表示の案内どおり **切断 → 再接続** すると `CONNECTED` に戻り、run / single-step を再開できること
+- `ERROR` 中に Connect や Run を押しても再開できず、切断が必要なこと

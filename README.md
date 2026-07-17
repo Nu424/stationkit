@@ -396,6 +396,8 @@ class GasBagController(StationControllerBase):
 
 - idle は新しい状態ではなく「`CONNECTED` に入るときに確立する振る舞い」です。`ControllerState` は変わりません。
 - **想定外エラーで `ERROR` になった execute のあとは呼ばれません**（装置状態が不確かなため、能動的な流路操作を避ける方針）。
+- **`ERROR` は安全ラッチです。** `change` / `execute` / `idle` / `connect`、および `ExecutionManager.start()` / `SequenceRunner.start()` は開始前に拒否されます。自動で `CONNECTED` へは戻りません。
+- **復帰手順は `disconnect` → `connect` です。** `disconnect` は `ERROR` からも呼べます（このとき idle はスキップされます）。切断後に再接続すると `CONNECTED` になり、実行を再開できます。Sequence App では ERROR 表示時に切断ボタンが有効になり、同じ手順を案内します。
 - 時間駆動シーケンス（`TIME_DRIVEN`）の待機ギャップ中は、直前ステップの execute 終端で idle が確立されるため、**追加のステップ無しで自動的に排気状態**になります。
 - 操作者が任意のタイミングで idle 状態へ戻したい場合は、公開 API `idle()` / `idle_async()`（および HTTP `POST /idle`、CLI `idle`、GUI「Go Idle」、Sequence App の待機ボタン）を使えます。`idle()` は `CONNECTED` のときのみ許可され、実行中や未接続では `StateError` になります。
 
@@ -466,6 +468,7 @@ if status.state == ExecutionState.SUCCEEDED:
 ```
 
 - `ExecutionManager` は **`controller.execute()` 全体** を single-worker thread で実行します（`_do_execute()` を直接呼ぶわけではありません）。
+- `start()` は controller が `CONNECTED` のときだけ許可されます。`ERROR` / `DISCONNECTED` などではジョブを作らず `StateError` になります。
 - `get_status()` は in-memory のジョブ状態のみを返し、装置 I/O は行いません。装置固有の状態は `controller.status()` 系で取得してください。
 - `cancel()` は worker thread を kill せず、controller 側の `cancel_execution()` フックに **協調的な中断要求** を委ねます。
 - `cancel_execution()` を実装していない controller に対して `ExecutionManager.cancel()` を呼ぶと、未対応エラーが返ります。
