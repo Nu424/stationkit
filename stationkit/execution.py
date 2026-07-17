@@ -115,10 +115,18 @@ class ExecutionManager:
 
         Raises:
             StateError: すでに進行中の execute が存在する場合。
+            StateError: controller が ``CONNECTED`` でない場合。
         """
         with self._lock:
             if self._has_active_execution_locked():
                 raise StateError("Execution is already running.")
+            # ERROR / DISCONNECTED などではジョブを作らず早期拒否する。
+            # 復帰は disconnect → connect の明示操作に委ねる。
+            if self._controller.state != ControllerState.CONNECTED:
+                raise StateError(
+                    "Operation requires CONNECTED state, "
+                    f"current: {self._controller.state.name}"
+                )
 
             # 実行開始前に公開状態を作り、worker と共有する。
             execution_id = uuid4().hex

@@ -29,7 +29,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from stationkit.core import SequenceMode, StateError, StationControllerBase, TimeoutError
+from stationkit.core import (
+    ControllerState,
+    SequenceMode,
+    StateError,
+    StationControllerBase,
+    TimeoutError,
+)
 from stationkit.core.execution_context import ExecutionContext
 from stationkit.core.introspection import (
     normalize_execute_params,
@@ -574,6 +580,7 @@ class SequenceRunner:
         Raises:
             ValueError: 検証に失敗した場合（ERROR issue のメッセージを連結する）。
             StateError: 既に別のシーケンス実行が進行中の場合。
+            StateError: controller が ``CONNECTED`` でない場合。
         """
         # ---シーケンス全体を検証する
         normalized = SequenceDefinition.model_validate(definition)
@@ -585,6 +592,13 @@ class SequenceRunner:
         with self._lock:
             if self._has_active_run_locked():
                 raise StateError("Sequence is already running.")
+            # ERROR 残留時などに RUNNING スナップショットを作らないよう、開始前に拒否する。
+            # 復帰は disconnect → connect の明示操作に委ねる。
+            if self._controller.state != ControllerState.CONNECTED:
+                raise StateError(
+                    "Operation requires CONNECTED state, "
+                    f"current: {self._controller.state.name}"
+                )
 
             # ---SequenceStepから、SequenceStepStatus -> SequenceSnapshotを作成する
             snapshot = SequenceSnapshot(
